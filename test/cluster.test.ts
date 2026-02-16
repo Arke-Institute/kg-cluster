@@ -2,7 +2,7 @@
  * E2E Test for KG Cluster Worker
  *
  * Tests the relationship-based discovery clustering algorithm:
- * 1. Solo entity creates its own cluster
+ * 1. Solo entity creates cluster, waits for followers, dissolves if alone
  * 2. Similar entities join existing clusters via summarized_by discovery
  * 3. Correct relationships are created (summarized_by, has_member)
  *
@@ -103,10 +103,10 @@ describe('kg-cluster', () => {
   });
 
   // ==========================================================================
-  // Test: Solo entity creates its own cluster
+  // Test: Solo entity creates cluster, waits, then dissolves if no followers
   // ==========================================================================
 
-  it('should create solo cluster when no similar peers exist', async () => {
+  it('should dissolve solo cluster when no followers join', async () => {
     if (!ARKE_USER_KEY || !KLADOS_ID) {
       console.warn('Test skipped: missing environment variables');
       return;
@@ -125,80 +125,69 @@ describe('kg-cluster', () => {
     createdEntities.push(uniqueEntity.id);
     log(`Created unique entity: ${uniqueEntity.id}`);
 
-    // Invoke clustering
-    log('Invoking cluster on unique entity...');
+    // Invoke clustering with short wait time for testing
+    log('Invoking cluster on unique entity (with 5s follower wait)...');
     const result = await invokeKlados({
       kladosId: KLADOS_ID,
       targetEntity: uniqueEntity.id,
       targetCollection: targetCollection.id,
+      input: {
+        follower_wait_ms: 5000,      // 5 second wait for testing
+        follower_poll_interval_ms: 1000, // 1 second poll
+      },
       confirm: true,
     });
 
     expect(result.status).toBe('started');
     log(`Job started: ${result.job_id}`);
 
-    // Wait for completion
+    // Wait for completion (should take ~5-10 seconds with short wait)
     const kladosLog = await waitForKladosLog(result.job_collection!, {
       timeout: 60000,
-      pollInterval: 3000,
+      pollInterval: 2000,
     });
 
     assertLogCompleted(kladosLog);
     log(`Job completed with status: ${kladosLog.properties.status}`);
-
-    // Verify log messages
-    assertLogHasMessages(kladosLog, [
-      { textContains: 'Starting clustering' },
-      { textContains: 'creating' }, // "creating solo cluster" or "creating new cluster"
-    ]);
 
     // Log all messages
     for (const msg of kladosLog.properties.log_data.messages) {
       log(`  [${msg.level}] ${msg.message}`);
     }
 
-    // Verify entity now has summarized_by relationship
+    // Verify log messages show the wait-and-dissolve pattern
+    assertLogHasMessages(kladosLog, [
+      { textContains: 'Starting clustering' },
+      { textContains: 'Waiting for followers' },
+      { textContains: 'dissolving' }, // "No followers after timeout, dissolving solo cluster"
+    ]);
+
+    // Verify entity does NOT have summarized_by relationship (cluster was dissolved)
     const updatedEntity = await getEntity(uniqueEntity.id);
     const summarizedBy = updatedEntity.relationships?.find(
       (r: { predicate: string }) => r.predicate === 'summarized_by'
     );
 
-    expect(summarizedBy).toBeDefined();
-    log(`Entity has summarized_by → ${summarizedBy?.peer}`);
+    expect(summarizedBy).toBeUndefined();
+    log('Entity has no summarized_by (cluster correctly dissolved)');
 
-    // Track the cluster for cleanup
-    if (summarizedBy) {
-      createdEntities.push(summarizedBy.peer);
-    }
-
-    // Verify cluster has has_member relationship back
-    const cluster = await getEntity(summarizedBy!.peer);
-    const hasMember = cluster.relationships?.find(
-      (r: { predicate: string; peer: string }) =>
-        r.predicate === 'has_member' && r.peer === uniqueEntity.id
-    );
-
-    expect(hasMember).toBeDefined();
-    log(`Cluster has has_member → ${uniqueEntity.id}`);
-
-    // Verify cluster properties
-    expect(cluster.type).toBe('cluster_leader');
-    expect(cluster.properties.label).toContain('cluster_');
-    expect(cluster.properties._kg_layer).toBe(1);
-    log(`Cluster verified: type=${cluster.type}, layer=${cluster.properties._kg_layer}`);
+    // Verify the output was empty (hierarchy terminates)
+    const outputs = kladosLog.properties.log_data.entry?.handoffs || [];
+    expect(outputs.length).toBe(0);
+    log('No outputs (hierarchy correctly terminates)');
   });
 
   // ==========================================================================
-  // Test: Second similar entity joins existing cluster
+  // Test: Similar entities cluster together via concurrent processing
   // ==========================================================================
 
-  it('should join existing cluster when similar peer has summarized_by', async () => {
+  it('should form cluster when similar entities process concurrently', async () => {
     if (!ARKE_USER_KEY || !KLADOS_ID) {
       console.warn('Test skipped: missing environment variables');
       return;
     }
 
-    // Create first entity (whale-related)
+    // Create two similar entities at the same time
     const entity1 = await createEntity({
       type: 'person',
       properties: {
@@ -211,39 +200,6 @@ describe('kg-cluster', () => {
     createdEntities.push(entity1.id);
     log(`Created entity1 (Captain Ahab): ${entity1.id}`);
 
-    // Wait for semantic index to propagate
-    log('Waiting 60s for semantic index to propagate...');
-    await new Promise((resolve) => setTimeout(resolve, 60000));
-
-    // Cluster the first entity
-    log('Clustering entity1...');
-    const result1 = await invokeKlados({
-      kladosId: KLADOS_ID,
-      targetEntity: entity1.id,
-      targetCollection: targetCollection.id,
-      confirm: true,
-    });
-
-    const log1 = await waitForKladosLog(result1.job_collection!, {
-      timeout: 60000,
-      pollInterval: 3000,
-    });
-    assertLogCompleted(log1);
-
-    // Get the cluster that was created
-    const entity1Updated = await getEntity(entity1.id);
-    const cluster1Rel = entity1Updated.relationships?.find(
-      (r: { predicate: string }) => r.predicate === 'summarized_by'
-    );
-    expect(cluster1Rel).toBeDefined();
-    createdEntities.push(cluster1Rel!.peer);
-    log(`Entity1 is in cluster: ${cluster1Rel!.peer}`);
-
-    // Wait for entity1's summarized_by relationship to be indexed
-    log('Waiting 60s for entity1 relationships to be indexed...');
-    await new Promise((resolve) => setTimeout(resolve, 60000));
-
-    // Create second similar entity (also whale-related)
     const entity2 = await createEntity({
       type: 'person',
       properties: {
@@ -256,52 +212,106 @@ describe('kg-cluster', () => {
     createdEntities.push(entity2.id);
     log(`Created entity2 (Ahab the Hunter): ${entity2.id}`);
 
-    // Cluster the second entity - should find entity1's cluster via summarized_by
-    log('Clustering entity2 (should join existing cluster)...');
+    // Wait for semantic index to propagate for both entities
+    log('Waiting 60s for semantic index to propagate...');
+    await new Promise((resolve) => setTimeout(resolve, 60000));
+
+    // Start clustering entity1 first (it will create a cluster and wait for followers)
+    log('Clustering entity1 (will wait for followers)...');
+    const result1 = await invokeKlados({
+      kladosId: KLADOS_ID,
+      targetEntity: entity1.id,
+      targetCollection: targetCollection.id,
+      input: {
+        follower_wait_ms: 90000,        // Wait 90s for followers
+        follower_poll_interval_ms: 5000,
+      },
+      confirm: true,
+    });
+    log(`Entity1 job started: ${result1.job_id}`);
+
+    // Wait a bit for entity1 to create its cluster
+    log('Waiting 10s for entity1 to create cluster...');
+    await new Promise((resolve) => setTimeout(resolve, 10000));
+
+    // Start clustering entity2 - should find entity1's cluster and join it
+    log('Clustering entity2 (should join entity1\'s cluster)...');
     const result2 = await invokeKlados({
       kladosId: KLADOS_ID,
       targetEntity: entity2.id,
       targetCollection: targetCollection.id,
+      input: {
+        follower_wait_ms: 30000,        // Shorter wait since it should join existing
+        follower_poll_interval_ms: 5000,
+      },
       confirm: true,
     });
+    log(`Entity2 job started: ${result2.job_id}`);
 
+    // Wait for entity2 to complete first (it joins and exits quickly)
+    log('Waiting for entity2 to complete...');
     const log2 = await waitForKladosLog(result2.job_collection!, {
-      timeout: 60000,
+      timeout: 120000,
       pollInterval: 3000,
     });
     assertLogCompleted(log2);
 
-    // Log messages
+    log('Entity2 log messages:');
     for (const msg of log2.properties.log_data.messages) {
       log(`  [${msg.level}] ${msg.message}`);
     }
 
-    // Verify entity2 joined the SAME cluster as entity1
+    // Wait for entity1 to complete (should detect follower and exit)
+    log('Waiting for entity1 to complete...');
+    const log1 = await waitForKladosLog(result1.job_collection!, {
+      timeout: 120000,
+      pollInterval: 3000,
+    });
+    assertLogCompleted(log1);
+
+    log('Entity1 log messages:');
+    for (const msg of log1.properties.log_data.messages) {
+      log(`  [${msg.level}] ${msg.message}`);
+    }
+
+    // Verify both entities have summarized_by relationships
+    const entity1Updated = await getEntity(entity1.id);
+    const cluster1Rel = entity1Updated.relationships?.find(
+      (r: { predicate: string }) => r.predicate === 'summarized_by'
+    );
+    expect(cluster1Rel).toBeDefined();
+    log(`Entity1 is in cluster: ${cluster1Rel!.peer}`);
+    createdEntities.push(cluster1Rel!.peer);
+
     const entity2Updated = await getEntity(entity2.id);
     const cluster2Rel = entity2Updated.relationships?.find(
       (r: { predicate: string }) => r.predicate === 'summarized_by'
     );
-
     expect(cluster2Rel).toBeDefined();
     log(`Entity2 is in cluster: ${cluster2Rel!.peer}`);
 
-    // Check if it's the same cluster (may or may not be, depends on semantic similarity)
+    // Check if they're in the same cluster
     if (cluster2Rel!.peer === cluster1Rel!.peer) {
-      log('SUCCESS: Entity2 joined entity1\'s cluster via summarized_by discovery');
+      log('SUCCESS: Both entities in the same cluster!');
+
+      // Verify cluster has both members
+      const cluster = await getEntity(cluster1Rel!.peer);
+      const members = cluster.relationships?.filter(
+        (r: { predicate: string }) => r.predicate === 'has_member'
+      ) || [];
+      log(`Cluster has ${members.length} members`);
+      expect(members.length).toBe(2);
+
+      // Verify entity1's log shows followers joined
+      assertLogHasMessages(log1, [
+        { textContains: 'Followers joined cluster' },
+      ]);
     } else {
-      log('Entity2 created its own cluster (semantic similarity may not have matched)');
+      // They created separate clusters - this is OK if semantic similarity didn't match
+      log('Entities created separate clusters (semantic similarity may not have matched)');
       createdEntities.push(cluster2Rel!.peer);
     }
-
-    // Either way, verify the relationship structure is correct
-    const cluster2 = await getEntity(cluster2Rel!.peer);
-    const hasMember2 = cluster2.relationships?.find(
-      (r: { predicate: string; peer: string }) =>
-        r.predicate === 'has_member' && r.peer === entity2.id
-    );
-    expect(hasMember2).toBeDefined();
-    log('Bidirectional relationships verified');
-  });
+  }, 300000); // 5 minute timeout for this test
 
   // ==========================================================================
   // Test: Preview mode
