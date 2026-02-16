@@ -25,6 +25,16 @@ export interface TargetProperties {
 }
 
 /**
+ * Configurable properties for clustering behavior
+ */
+export interface ClusterInputProperties {
+  /** Max time to wait for followers before dissolving solo cluster (ms, default: 90000) */
+  follower_wait_ms?: number;
+  /** Interval between follower checks (ms, default: 10000) */
+  follower_poll_interval_ms?: number;
+}
+
+/**
  * Semantic search result from the API
  */
 export interface SemanticCandidate {

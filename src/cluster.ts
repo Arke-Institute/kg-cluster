@@ -169,3 +169,77 @@ export async function joinCluster(
 
   console.log(`[cluster] ${myEntityId} joined ${clusterId}`);
 }
+
+/**
+ * Get the number of members in a cluster
+ */
+export async function getClusterMemberCount(
+  client: ArkeClient,
+  clusterId: string
+): Promise<number> {
+  const { data, error } = await client.api.GET('/entities/{id}', {
+    params: { path: { id: clusterId } },
+  });
+
+  if (error || !data) {
+    console.error(`[cluster] Failed to fetch cluster ${clusterId}: ${JSON.stringify(error)}`);
+    return 0;
+  }
+
+  const members = (data.relationships || []).filter(
+    (r) => r.predicate === 'has_member'
+  );
+
+  return members.length;
+}
+
+/**
+ * Dissolve a solo cluster (remove relationships and delete cluster entity)
+ *
+ * 1. Remove summarized_by from the entity
+ * 2. Delete the cluster entity
+ */
+export async function dissolveCluster(
+  client: ArkeClient,
+  entityId: string,
+  clusterId: string
+): Promise<void> {
+  console.log(`[cluster] Dissolving solo cluster ${clusterId}`);
+
+  // 1. Remove summarized_by from entity
+  const { data: entityTip, error: tipError } = await client.api.GET('/entities/{id}/tip', {
+    params: { path: { id: entityId } },
+  });
+
+  if (tipError || !entityTip) {
+    console.error(`[cluster] Failed to get tip for ${entityId}: ${JSON.stringify(tipError)}`);
+  } else {
+    const { error: updateError } = await client.api.PUT('/entities/{id}', {
+      params: { path: { id: entityId } },
+      body: {
+        expect_tip: entityTip.cid,
+        relationships_remove: [
+          {
+            predicate: 'summarized_by',
+            peer: clusterId,
+          },
+        ],
+      },
+    });
+
+    if (updateError) {
+      console.error(`[cluster] Failed to remove summarized_by: ${JSON.stringify(updateError)}`);
+    }
+  }
+
+  // 2. Delete the cluster entity
+  const { error: deleteError } = await client.api.DELETE('/entities/{id}', {
+    params: { path: { id: clusterId } },
+  });
+
+  if (deleteError) {
+    console.error(`[cluster] Failed to delete cluster ${clusterId}: ${JSON.stringify(deleteError)}`);
+  } else {
+    console.log(`[cluster] Dissolved cluster ${clusterId}`);
+  }
+}
