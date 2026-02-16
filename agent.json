@@ -1,0 +1,14 @@
+{
+  "label": "KG Cluster",
+  "description": "Clusters semantically similar entities using relationship-based discovery. Checks peers for summarized_by relationships to find existing clusters, or creates new clusters.",
+  "endpoint": "https://kg-cluster.nick-chimicles-professional.workers.dev",
+  "actions_required": ["entity:view", "entity:create", "entity:update"],
+  "accepts": {
+    "types": ["*"],
+    "cardinality": "one"
+  },
+  "produces": {
+    "types": ["cluster_leader"],
+    "cardinality": "one"
+  }
+}

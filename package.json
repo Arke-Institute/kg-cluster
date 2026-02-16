@@ -1,0 +1,30 @@
+{
+  "name": "kg-cluster",
+  "version": "1.0.0",
+  "description": "Knowledge Graph Cluster - Clusters semantically similar entities using relationship-based discovery",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "type-check": "tsc --noEmit",
+    "register": "npx tsx scripts/register.ts",
+    "register:prod": "npx tsx scripts/register.ts --production",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@arke-institute/rhiza": "^0.4.1",
+    "@arke-institute/sdk": "^3.6.6",
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@arke-institute/klados-testing": "^0.3.0",
+    "@cloudflare/workers-types": "^4.20241230.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^7.3.1",
+    "vitest": "^2.0.0",
+    "wrangler": "^3.99.0"
+  }
+}
