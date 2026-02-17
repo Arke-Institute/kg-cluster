@@ -19,12 +19,13 @@ import {
   createCluster,
   joinCluster,
   getClusterMemberCount,
-  dissolveCluster,
+  fallbackJoinCluster,
 } from './cluster';
 
 // Default wait parameters
 const DEFAULT_FOLLOWER_WAIT_MS = 90000; // 90 seconds
 const DEFAULT_FOLLOWER_POLL_INTERVAL_MS = 10000; // 10 seconds
+const DEFAULT_RECHECK_DELAY_MS = 10000; // 10 seconds - delay before creating cluster to let concurrent jobs establish theirs
 
 /**
  * Sleep for a given number of milliseconds
@@ -47,18 +48,32 @@ export interface ProcessResult {
 }
 
 /**
+ * Result from waitForFollowers
+ */
+type WaitResult =
+  | { action: 'has_followers'; clusterId: string }
+  | { action: 'leader'; clusterId: string }
+  | { action: 'joined' }
+  | { action: 'dissolved' };
+
+/**
  * Wait for followers to join a newly created cluster.
- * If followers join, returns the clusterId to propagate.
- * If still alone after timeout, dissolves the cluster and returns null.
+ *
+ * After timeout, uses fallback clustering (fast SQLite index) to either:
+ * - Join an existing cluster found via lexicographic leader election
+ * - Become leader if first in sorted order
+ * - Dissolve if truly the only entity at this layer
  */
 async function waitForFollowers(
   client: ArkeClient,
   logger: KladosLogger,
   entityId: string,
   clusterId: string,
+  collectionId: string,
+  myLayer: number,
   maxWaitMs: number,
   pollIntervalMs: number
-): Promise<string | null> {
+): Promise<WaitResult> {
   const startTime = Date.now();
 
   logger.info('Waiting for followers', {
@@ -79,7 +94,7 @@ async function waitForFollowers(
         memberCount,
         elapsedSec: elapsed,
       });
-      return clusterId;
+      return { action: 'has_followers', clusterId };
     }
 
     logger.info('Still waiting for followers', {
@@ -89,14 +104,26 @@ async function waitForFollowers(
     });
   }
 
-  // Timeout - still alone, dissolve the cluster
-  logger.info('No followers after timeout, dissolving solo cluster', {
-    clusterId,
-    waitedMs: maxWaitMs,
-  });
+  // Timeout - try fallback clustering using fast SQLite index
+  logger.info('Timeout waiting for followers, attempting fallback clustering');
 
-  await dissolveCluster(client, entityId, clusterId);
-  return null;
+  const fallbackResult = await fallbackJoinCluster(
+    client,
+    entityId,
+    clusterId,
+    collectionId,
+    myLayer,
+    logger
+  );
+
+  switch (fallbackResult) {
+    case 'joined':
+      return { action: 'joined' };
+    case 'leader':
+      return { action: 'leader', clusterId };
+    case 'dissolved':
+      return { action: 'dissolved' };
+  }
 }
 
 /**
@@ -171,22 +198,31 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     );
     await joinCluster(client, target.id, clusterId);
 
-    // Wait for followers - if none join, cluster is dissolved
-    const survivingClusterId = await waitForFollowers(
+    // Wait for followers, with fallback clustering on timeout
+    const result = await waitForFollowers(
       client,
       logger,
       target.id,
       clusterId,
+      request.target_collection,
+      myLayer,
       followerWaitMs,
       followerPollIntervalMs
     );
 
-    if (survivingClusterId) {
-      logger.success('Cluster has followers, propagating', { clusterId: survivingClusterId });
-      return { outputs: [survivingClusterId] };
-    } else {
-      logger.success('Solo cluster dissolved, hierarchy terminates here');
-      return { outputs: [] };
+    switch (result.action) {
+      case 'has_followers':
+        logger.success('Cluster has followers, propagating', { clusterId: result.clusterId });
+        return { outputs: [result.clusterId] };
+      case 'leader':
+        logger.success('Became leader via fallback, propagating', { clusterId: result.clusterId });
+        return { outputs: [result.clusterId] };
+      case 'joined':
+        logger.success('Joined existing cluster via fallback');
+        return { outputs: [] };
+      case 'dissolved':
+        logger.success('Dissolved - only entity at this layer');
+        return { outputs: [] };
     }
   }
 
@@ -222,9 +258,34 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STEP 5: Create Own Cluster and Wait for Followers
+  // STEP 5: Re-check After Delay (Race Condition Mitigation)
   // ═══════════════════════════════════════════════════════════════════════════
-  logger.info('No existing cluster found, creating new cluster');
+  // Wait briefly and re-check peers - concurrent cluster jobs may have established their clusters
+  logger.info('No existing cluster found, waiting before re-check', { delayMs: DEFAULT_RECHECK_DELAY_MS });
+  await sleep(DEFAULT_RECHECK_DELAY_MS);
+
+  // Re-fetch peers to check if any now have summarized_by
+  const recheckPeers = await fetchPeers(client, similarPeers);
+  const recheckCluster = findExistingCluster(recheckPeers);
+
+  if (recheckCluster) {
+    logger.info('Found cluster on re-check', {
+      clusterId: recheckCluster.clusterId,
+      peerId: recheckCluster.peerId,
+    });
+
+    await joinCluster(client, target.id, recheckCluster.clusterId);
+    logger.success('Joined existing cluster after re-check', {
+      clusterId: recheckCluster.clusterId,
+    });
+
+    return { outputs: [] };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STEP 6: Create Own Cluster and Wait for Followers
+  // ═══════════════════════════════════════════════════════════════════════════
+  logger.info('Still no existing cluster after re-check, creating new cluster');
 
   const clusterId = await createCluster(
     client,
@@ -234,21 +295,30 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   );
   await joinCluster(client, target.id, clusterId);
 
-  // Wait for followers - other similar peers may join this cluster
-  const survivingClusterId = await waitForFollowers(
+  // Wait for followers, with fallback clustering on timeout
+  const result = await waitForFollowers(
     client,
     logger,
     target.id,
     clusterId,
+    request.target_collection,
+    myLayer,
     followerWaitMs,
     followerPollIntervalMs
   );
 
-  if (survivingClusterId) {
-    logger.success('Cluster has followers, propagating', { clusterId: survivingClusterId });
-    return { outputs: [survivingClusterId] };
-  } else {
-    logger.success('Solo cluster dissolved, hierarchy terminates here');
-    return { outputs: [] };
+  switch (result.action) {
+    case 'has_followers':
+      logger.success('Cluster has followers, propagating', { clusterId: result.clusterId });
+      return { outputs: [result.clusterId] };
+    case 'leader':
+      logger.success('Became leader via fallback, propagating', { clusterId: result.clusterId });
+      return { outputs: [result.clusterId] };
+    case 'joined':
+      logger.success('Joined existing cluster via fallback');
+      return { outputs: [] };
+    case 'dissolved':
+      logger.success('Dissolved - only entity at this layer');
+      return { outputs: [] };
   }
 }

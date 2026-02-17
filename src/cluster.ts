@@ -8,8 +8,12 @@
  * 4. If not found, create own cluster
  */
 
-import type { ArkeClient } from '@arke-institute/sdk';
+import { withCasRetry, type ArkeClient } from '@arke-institute/sdk';
+import type { KladosLogger } from '@arke-institute/rhiza';
 import type { PeerEntity, ClusterMatch, SemanticCandidate } from './types';
+
+// Expected concurrent cluster joins (matches semantic search limit)
+const CLUSTER_CONCURRENCY = 15;
 
 /**
  * Fetch multiple peers in parallel
@@ -141,30 +145,44 @@ export async function joinCluster(
   }
 
   // 2. Add has_member on cluster (enables gathering)
-  const { data: clusterTip, error: clusterTipError } = await client.api.GET('/entities/{id}/tip', {
-    params: { path: { id: clusterId } },
-  });
-
-  if (clusterTipError || !clusterTip) {
-    throw new Error(`Failed to get tip for cluster ${clusterId}: ${JSON.stringify(clusterTipError)}`);
-  }
-
-  const { error: clusterUpdateError } = await client.api.PUT('/entities/{id}', {
-    params: { path: { id: clusterId } },
-    body: {
-      expect_tip: clusterTip.cid,
-      relationships_add: [
-        {
-          predicate: 'has_member',
-          peer: myEntityId,
-          direction: 'outgoing',
-        },
-      ],
+  // Use withCasRetry for robust concurrent join handling
+  const { attempts } = await withCasRetry(
+    {
+      getTip: async () => {
+        const { data, error } = await client.api.GET('/entities/{id}/tip', {
+          params: { path: { id: clusterId } },
+        });
+        if (error || !data) {
+          throw new Error(`Failed to get tip for cluster ${clusterId}: ${JSON.stringify(error)}`);
+        }
+        return data.cid;
+      },
+      update: async (tip) => {
+        return client.api.PUT('/entities/{id}', {
+          params: { path: { id: clusterId } },
+          body: {
+            expect_tip: tip,
+            relationships_add: [
+              {
+                predicate: 'has_member',
+                peer: myEntityId,
+                direction: 'outgoing',
+              },
+            ],
+          },
+        });
+      },
     },
-  });
+    {
+      concurrency: CLUSTER_CONCURRENCY,
+      onRetry: (attempt, _error, delayMs) => {
+        console.log(`[cluster] CAS retry ${attempt} for ${clusterId}, waiting ${delayMs}ms`);
+      },
+    }
+  );
 
-  if (clusterUpdateError) {
-    throw new Error(`Failed to add has_member: ${JSON.stringify(clusterUpdateError)}`);
+  if (attempts > 1) {
+    console.log(`[cluster] Joined ${clusterId} after ${attempts} attempts`);
   }
 
   console.log(`[cluster] ${myEntityId} joined ${clusterId}`);
@@ -232,9 +250,21 @@ export async function dissolveCluster(
     }
   }
 
-  // 2. Delete the cluster entity
+  // 2. Delete the cluster entity (requires expect_tip)
+  const { data: clusterTip, error: clusterTipError } = await client.api.GET('/entities/{id}/tip', {
+    params: { path: { id: clusterId } },
+  });
+
+  if (clusterTipError || !clusterTip) {
+    console.error(`[cluster] Failed to get tip for cluster ${clusterId}: ${JSON.stringify(clusterTipError)}`);
+    return;
+  }
+
   const { error: deleteError } = await client.api.DELETE('/entities/{id}', {
     params: { path: { id: clusterId } },
+    body: {
+      expect_tip: clusterTip.cid,
+    },
   });
 
   if (deleteError) {
@@ -242,4 +272,154 @@ export async function dissolveCluster(
   } else {
     console.log(`[cluster] Dissolved cluster ${clusterId}`);
   }
+}
+
+/**
+ * Delete an empty cluster entity (when switching to another cluster)
+ */
+export async function deleteEmptyCluster(
+  client: ArkeClient,
+  clusterId: string
+): Promise<void> {
+  console.log(`[cluster] Deleting empty cluster ${clusterId}`);
+
+  const { data: tip, error: tipError } = await client.api.GET('/entities/{id}/tip', {
+    params: { path: { id: clusterId } },
+  });
+
+  if (tipError || !tip) {
+    console.error(`[cluster] Failed to get tip for cluster ${clusterId}: ${JSON.stringify(tipError)}`);
+    return;
+  }
+
+  const { error: deleteError } = await client.api.DELETE('/entities/{id}', {
+    params: { path: { id: clusterId } },
+    body: { expect_tip: tip.cid },
+  });
+
+  if (deleteError) {
+    console.error(`[cluster] Failed to delete cluster ${clusterId}: ${JSON.stringify(deleteError)}`);
+  } else {
+    console.log(`[cluster] Deleted empty cluster ${clusterId}`);
+  }
+}
+
+/**
+ * Fallback result type
+ */
+export type FallbackResult = 'joined' | 'leader' | 'dissolved';
+
+/**
+ * Entity listing response type
+ */
+interface EntityListItem {
+  id: string;
+  type: string;
+  properties?: Record<string, unknown>;
+}
+
+interface EntityListResponse {
+  entities: EntityListItem[];
+}
+
+/**
+ * Fallback clustering when no followers join within timeout.
+ *
+ * Uses the fast SQLite-indexed collection listing (not semantic search)
+ * to find peers at the same layer and join an existing cluster.
+ *
+ * Algorithm:
+ * 1. List all entities at same _kg_layer (fast SQLite index)
+ * 2. Sort lexicographically by ID (deterministic leader election)
+ * 3. Iterate through sorted list:
+ *    - If peer has summarized_by → join their cluster, delete mine
+ *    - If I reach myself → I'm leader, keep my cluster
+ * 4. If I'm the only entity at this layer → dissolve (truly alone)
+ */
+export async function fallbackJoinCluster(
+  client: ArkeClient,
+  myEntityId: string,
+  myClusterId: string,
+  collectionId: string,
+  myLayer: number,
+  logger: KladosLogger
+): Promise<FallbackResult> {
+  logger.info('Starting fallback clustering', { myEntityId, myLayer });
+
+  // 1. List entities at same layer using fast SQLite index
+  const filter = JSON.stringify({ _kg_layer: myLayer });
+  const { data, error } = await (client.api.GET as Function)('/collections/{id}/entities', {
+    params: {
+      path: { id: collectionId },
+      query: { filter, limit: 500 },
+    },
+  });
+
+  if (error || !data) {
+    logger.error('Fallback listing failed', { error: JSON.stringify(error) });
+    return 'leader'; // Keep cluster on error (safe default)
+  }
+
+  const response = data as EntityListResponse;
+  const entities = response.entities || [];
+
+  logger.info('Fallback found entities at layer', { count: entities.length, layer: myLayer });
+
+  // 2. Sort lexicographically by ID (deterministic leader election)
+  const sorted = [...entities].sort((a, b) => a.id.localeCompare(b.id));
+
+  // 3. Special case: I'm the only one → dissolve
+  if (sorted.length === 1 && sorted[0].id === myEntityId) {
+    logger.info('Only entity at this layer, dissolving');
+    await dissolveCluster(client, myEntityId, myClusterId);
+    return 'dissolved';
+  }
+
+  // 4. Iterate through sorted list
+  for (const entity of sorted) {
+    // If I reach myself, I'm the leader (first in list without summarized_by)
+    if (entity.id === myEntityId) {
+      logger.info('Reached self in sorted list, becoming leader', { position: sorted.indexOf(entity) });
+      return 'leader';
+    }
+
+    // Skip cluster_leader entities (they're clusters, not members)
+    if (entity.type === 'cluster_leader') {
+      continue;
+    }
+
+    // Fetch full entity to check for summarized_by
+    const { data: full, error: fetchError } = await client.api.GET('/entities/{id}', {
+      params: { path: { id: entity.id } },
+    });
+
+    if (fetchError || !full) {
+      logger.info('Failed to fetch peer, skipping', { peerId: entity.id });
+      continue;
+    }
+
+    const relationships = (full as { relationships?: Array<{ predicate: string; peer: string }> }).relationships || [];
+    const summarizedBy = relationships.find(r => r.predicate === 'summarized_by');
+
+    if (summarizedBy) {
+      // Found clustered peer! Join their cluster
+      const theirClusterId = summarizedBy.peer;
+      logger.info('Found clustered peer via fallback', {
+        peerId: entity.id,
+        theirClusterId,
+      });
+
+      // Join their cluster (adds summarized_by to me, has_member to cluster)
+      await joinCluster(client, myEntityId, theirClusterId);
+
+      // Delete my now-orphaned cluster
+      await deleteEmptyCluster(client, myClusterId);
+
+      return 'joined';
+    }
+  }
+
+  // Shouldn't reach here (would have hit myself in the loop), but keep cluster
+  logger.info('Fallback loop completed without finding self or cluster');
+  return 'leader';
 }
