@@ -120,7 +120,7 @@ describe('kg-cluster', () => {
         description: 'A completely unique entity with no semantic peers',
         _kg_layer: 0,
       },
-      collectionId: targetCollection.id,
+      collection: targetCollection.id,
     });
     createdEntities.push(uniqueEntity.id);
     log(`Created unique entity: ${uniqueEntity.id}`);
@@ -195,7 +195,7 @@ describe('kg-cluster', () => {
         description: 'The monomaniacal captain of the whaling ship Pequod, obsessed with hunting the white whale Moby Dick',
         _kg_layer: 0,
       },
-      collectionId: targetCollection.id,
+      collection: targetCollection.id,
     });
     createdEntities.push(entity1.id);
     log(`Created entity1 (Captain Ahab): ${entity1.id}`);
@@ -207,7 +207,7 @@ describe('kg-cluster', () => {
         description: 'A whaling captain consumed by his quest for revenge against a great white whale',
         _kg_layer: 0,
       },
-      collectionId: targetCollection.id,
+      collection: targetCollection.id,
     });
     createdEntities.push(entity2.id);
     log(`Created entity2 (Ahab the Hunter): ${entity2.id}`);
@@ -330,7 +330,7 @@ describe('kg-cluster', () => {
         description: 'Entity for testing preview mode',
         _kg_layer: 0,
       },
-      collectionId: targetCollection.id,
+      collection: targetCollection.id,
     });
     createdEntities.push(previewEntity.id);
 
