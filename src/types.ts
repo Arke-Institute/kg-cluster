@@ -28,10 +28,23 @@ export interface TargetProperties {
  * Configurable properties for clustering behavior
  */
 export interface ClusterInputProperties {
-  /** Max time to wait for followers before dissolving solo cluster (ms, default: 90000) */
-  follower_wait_ms?: number;
-  /** Interval between follower checks (ms, default: 10000) */
+  /** Max random delay before starting clustering (ms, default: 30000). Creates dispersion to avoid race conditions. */
+  initial_delay_max_ms?: number;
+  /** Minimum time to wait for followers (ms, default: 30000) */
+  follower_wait_min_ms?: number;
+  /** Maximum time to wait for followers (ms, default: 60000) */
+  follower_wait_max_ms?: number;
+  /** Interval between follower checks (ms, default: 5000) */
   follower_poll_interval_ms?: number;
+}
+
+/**
+ * Entity info needed for semantic fallback
+ */
+export interface EntityInfo {
+  id: string;
+  label?: string;
+  description?: string;
 }
 
 /**

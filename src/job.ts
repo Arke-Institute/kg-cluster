@@ -11,7 +11,7 @@
 
 import type { ArkeClient } from '@arke-institute/sdk';
 import type { KladosLogger, KladosRequest, Output } from '@arke-institute/rhiza';
-import type { Env, TargetProperties, ClusterInputProperties } from './types';
+import type { Env, TargetProperties, ClusterInputProperties, EntityInfo } from './types';
 import { findSimilarPeers } from './semantic';
 import {
   fetchPeers,
@@ -22,10 +22,22 @@ import {
   fallbackJoinCluster,
 } from './cluster';
 
-// Default wait parameters
-const DEFAULT_FOLLOWER_WAIT_MS = 90000; // 90 seconds
-const DEFAULT_FOLLOWER_POLL_INTERVAL_MS = 10000; // 10 seconds
-const DEFAULT_RECHECK_DELAY_MS = 10000; // 10 seconds - delay before creating cluster to let concurrent jobs establish theirs
+// Default wait parameters - jittery to create natural dispersion
+// Longer defaults give entities more time to find each other via semantic search
+// Semantic fallback catches entities that still miss each other after wait period
+const DEFAULT_INITIAL_DELAY_MAX_MS = 30000; // 30 seconds max random initial delay to stagger starts
+const DEFAULT_FOLLOWER_WAIT_MIN_MS = 30000; // 30 seconds minimum
+const DEFAULT_FOLLOWER_WAIT_MAX_MS = 60000; // 60 seconds maximum
+const DEFAULT_FOLLOWER_POLL_INTERVAL_MS = 5000; // 5 seconds
+const DEFAULT_RECHECK_DELAY_MS = 3000; // 3 seconds - delay before creating cluster to let concurrent jobs establish theirs
+
+/**
+ * Generate a random wait time between min and max (jittery)
+ * Creates natural dispersion - some entities finish waiting earlier
+ */
+function getJitteryWait(minMs: number, maxMs: number): number {
+  return minMs + Math.floor(Math.random() * (maxMs - minMs));
+}
 
 /**
  * Sleep for a given number of milliseconds
@@ -59,30 +71,32 @@ type WaitResult =
 /**
  * Wait for followers to join a newly created cluster.
  *
- * After timeout, uses fallback clustering (fast SQLite index) to either:
- * - Join an existing cluster found via lexicographic leader election
- * - Become leader if first in sorted order
- * - Dissolve if truly the only entity at this layer
+ * Uses jittery wait time to create natural dispersion.
+ * After timeout, uses fallback clustering:
+ * 1. First: Semantic search (entities should be indexed by now)
+ * 2. Second: Lexicographic leader election (last resort)
  */
 async function waitForFollowers(
   client: ArkeClient,
   logger: KladosLogger,
-  entityId: string,
+  entity: EntityInfo,
   clusterId: string,
   collectionId: string,
   myLayer: number,
+  minWaitMs: number,
   maxWaitMs: number,
   pollIntervalMs: number
 ): Promise<WaitResult> {
   const startTime = Date.now();
+  const jitteryWaitMs = getJitteryWait(minWaitMs, maxWaitMs);
 
-  logger.info('Waiting for followers', {
+  logger.info('Waiting for followers (jittery)', {
     clusterId,
-    maxWaitMs,
+    jitteryWaitMs,
     pollIntervalMs,
   });
 
-  while (Date.now() - startTime < maxWaitMs) {
+  while (Date.now() - startTime < jitteryWaitMs) {
     await sleep(pollIntervalMs);
 
     const memberCount = await getClusterMemberCount(client, clusterId);
@@ -104,12 +118,12 @@ async function waitForFollowers(
     });
   }
 
-  // Timeout - try fallback clustering using fast SQLite index
+  // Timeout - try fallback clustering (semantic first, then lexicographic)
   logger.info('Timeout waiting for followers, attempting fallback clustering');
 
   const fallbackResult = await fallbackJoinCluster(
     client,
-    entityId,
+    entity,
     clusterId,
     collectionId,
     myLayer,
@@ -137,10 +151,23 @@ async function waitForFollowers(
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   const { request, client, logger } = ctx;
 
-  // Extract configurable wait parameters
+  // Extract configurable parameters
   const inputProps = (request.input || {}) as ClusterInputProperties;
-  const followerWaitMs = inputProps.follower_wait_ms ?? DEFAULT_FOLLOWER_WAIT_MS;
+  const initialDelayMaxMs = inputProps.initial_delay_max_ms ?? DEFAULT_INITIAL_DELAY_MAX_MS;
+  const followerWaitMinMs = inputProps.follower_wait_min_ms ?? DEFAULT_FOLLOWER_WAIT_MIN_MS;
+  const followerWaitMaxMs = inputProps.follower_wait_max_ms ?? DEFAULT_FOLLOWER_WAIT_MAX_MS;
   const followerPollIntervalMs = inputProps.follower_poll_interval_ms ?? DEFAULT_FOLLOWER_POLL_INTERVAL_MS;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STEP 0: Staggered Start (avoid race conditions)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Random initial delay creates natural dispersion. Early starters get indexed
+  // before later starters search, allowing them to find and join existing clusters.
+  if (initialDelayMaxMs > 0) {
+    const delay = Math.floor(Math.random() * initialDelayMaxMs);
+    logger.info('Staggered start delay', { delayMs: delay, maxDelayMs: initialDelayMaxMs });
+    await sleep(delay);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // STEP 1: Fetch Target Entity and Get Layer
@@ -183,7 +210,7 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
       description: properties.description as string | undefined,
     },
     myLayer,
-    15
+    5 // Smaller K creates more distinct clusters
   );
 
   if (similarPeers.length === 0) {
@@ -202,11 +229,12 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     const result = await waitForFollowers(
       client,
       logger,
-      target.id,
+      { id: target.id, label: properties.label, description: properties.description as string | undefined },
       clusterId,
       request.target_collection,
       myLayer,
-      followerWaitMs,
+      followerWaitMinMs,
+      followerWaitMaxMs,
       followerPollIntervalMs
     );
 
@@ -299,11 +327,12 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   const result = await waitForFollowers(
     client,
     logger,
-    target.id,
+    { id: target.id, label: properties.label, description: properties.description as string | undefined },
     clusterId,
     request.target_collection,
     myLayer,
-    followerWaitMs,
+    followerWaitMinMs,
+    followerWaitMaxMs,
     followerPollIntervalMs
   );
 
