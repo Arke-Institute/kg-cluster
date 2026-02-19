@@ -28,8 +28,10 @@ export interface TargetProperties {
  * Configurable properties for clustering behavior
  */
 export interface ClusterInputProperties {
-  /** Max random delay before starting clustering (ms, default: 30000). Creates dispersion to avoid race conditions. */
-  initial_delay_max_ms?: number;
+  /** Minimum wait for semantic indexing before searching (ms, default: 30000). Entities must be indexed to be found. */
+  index_wait_ms?: number;
+  /** Additional random spread for staggering starts (ms, default: 30000). Total delay = index_wait + random(0, spread). */
+  initial_spread_ms?: number;
   /** Minimum time to wait for followers (ms, default: 30000) */
   follower_wait_min_ms?: number;
   /** Maximum time to wait for followers (ms, default: 60000) */

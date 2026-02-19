@@ -22,10 +22,12 @@ import {
   fallbackJoinCluster,
 } from './cluster';
 
-// Default wait parameters - jittery to create natural dispersion
-// Longer defaults give entities more time to find each other via semantic search
-// Semantic fallback catches entities that still miss each other after wait period
-const DEFAULT_INITIAL_DELAY_MAX_MS = 30000; // 30 seconds max random initial delay to stagger starts
+// Default wait parameters
+// INDEX_WAIT: Minimum wait for semantic indexing before searching (entities must be indexed to be found)
+// INITIAL_SPREAD: Additional random spread for staggering (creates dispersion so not all search at once)
+// Total initial delay = INDEX_WAIT + random(0, INITIAL_SPREAD) = 30-60s
+const DEFAULT_INDEX_WAIT_MS = 30000; // 30 seconds minimum - wait for semantic index
+const DEFAULT_INITIAL_SPREAD_MS = 30000; // 30 seconds spread for staggering
 const DEFAULT_FOLLOWER_WAIT_MIN_MS = 30000; // 30 seconds minimum
 const DEFAULT_FOLLOWER_WAIT_MAX_MS = 60000; // 60 seconds maximum
 const DEFAULT_FOLLOWER_POLL_INTERVAL_MS = 5000; // 5 seconds
@@ -153,20 +155,27 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
 
   // Extract configurable parameters
   const inputProps = (request.input || {}) as ClusterInputProperties;
-  const initialDelayMaxMs = inputProps.initial_delay_max_ms ?? DEFAULT_INITIAL_DELAY_MAX_MS;
+  const indexWaitMs = inputProps.index_wait_ms ?? DEFAULT_INDEX_WAIT_MS;
+  const initialSpreadMs = inputProps.initial_spread_ms ?? DEFAULT_INITIAL_SPREAD_MS;
   const followerWaitMinMs = inputProps.follower_wait_min_ms ?? DEFAULT_FOLLOWER_WAIT_MIN_MS;
   const followerWaitMaxMs = inputProps.follower_wait_max_ms ?? DEFAULT_FOLLOWER_WAIT_MAX_MS;
   const followerPollIntervalMs = inputProps.follower_poll_interval_ms ?? DEFAULT_FOLLOWER_POLL_INTERVAL_MS;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STEP 0: Staggered Start (avoid race conditions)
+  // STEP 0: Wait for Indexing + Staggered Start
   // ═══════════════════════════════════════════════════════════════════════════
-  // Random initial delay creates natural dispersion. Early starters get indexed
-  // before later starters search, allowing them to find and join existing clusters.
-  if (initialDelayMaxMs > 0) {
-    const delay = Math.floor(Math.random() * initialDelayMaxMs);
-    logger.info('Staggered start delay', { delayMs: delay, maxDelayMs: initialDelayMaxMs });
-    await sleep(delay);
+  // First wait for semantic indexing (entities must be indexed to be found in search).
+  // Then add random spread for dispersion (so not all entities search at exactly the same time).
+  // Total delay = indexWaitMs + random(0, initialSpreadMs) = typically 30-60s
+  const spreadDelay = Math.floor(Math.random() * initialSpreadMs);
+  const totalDelay = indexWaitMs + spreadDelay;
+  if (totalDelay > 0) {
+    logger.info('Initial delay (index wait + spread)', {
+      indexWaitMs,
+      spreadDelayMs: spreadDelay,
+      totalDelayMs: totalDelay
+    });
+    await sleep(totalDelay);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
