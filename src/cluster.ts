@@ -475,10 +475,8 @@ export async function fallbackJoinCluster(
       return 'leader';
     }
 
-    // Skip cluster_leader entities (they're clusters, not members)
-    if (ent.type === 'cluster_leader') {
-      continue;
-    }
+    // Note: Do NOT skip cluster_leader entities - at Layer 1+, all entities are clusters
+    // and we need to check if they have summarized_by pointing to a higher-layer cluster
 
     // Fetch full entity to check for summarized_by
     const { data: full, error: fetchError } = await client.api.GET('/entities/{id}', {
