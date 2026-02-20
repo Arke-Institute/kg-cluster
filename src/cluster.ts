@@ -11,7 +11,17 @@
 import type { ArkeClient } from '@arke-institute/sdk';
 import type { KladosLogger } from '@arke-institute/rhiza';
 import type { PeerEntity, ClusterMatch, SemanticCandidate, EntityInfo } from './types';
-import { findSimilarPeers } from './semantic';
+import { findSimilarPeers, isMutualPeer } from './semantic';
+
+/**
+ * Configuration for mutual K-nearest neighbors
+ */
+export interface MutualConfig {
+  enabled: boolean;
+  k: number;
+  collection: string;
+  myLayer: number;
+}
 
 /**
  * Fetch multiple peers in parallel
@@ -45,9 +55,20 @@ export async function fetchPeers(
 /**
  * Find existing cluster from peer relationships
  *
- * Checks each peer (in similarity order) for summarized_by relationship
+ * Checks each peer (in similarity order) for summarized_by relationship.
+ * If mutual config is enabled, also verifies the peer has us in their top-K.
+ *
+ * @param client - Arke client (needed for mutual check)
+ * @param myEntity - Our entity info
+ * @param peers - Peer entities to check
+ * @param mutualConfig - Mutual K-nearest neighbors configuration
  */
-export function findExistingCluster(peers: PeerEntity[]): ClusterMatch | null {
+export async function findExistingCluster(
+  client: ArkeClient,
+  myEntity: EntityInfo,
+  peers: PeerEntity[],
+  mutualConfig: MutualConfig
+): Promise<ClusterMatch | null> {
   // Sort by similarity (highest first)
   const sortedPeers = [...peers].sort((a, b) => b.similarity - a.similarity);
 
@@ -61,6 +82,31 @@ export function findExistingCluster(peers: PeerEntity[]): ClusterMatch | null {
     );
 
     if (clusterRel) {
+      // If mutual mode enabled, verify peer also has us in their top-K
+      if (mutualConfig.enabled) {
+        const peerEntity: EntityInfo = {
+          id: peer.id,
+          label: peer.properties?.label,
+          description: peer.properties?.description as string | undefined,
+        };
+
+        const isMutual = await isMutualPeer(
+          client,
+          mutualConfig.collection,
+          myEntity,
+          peerEntity,
+          mutualConfig.myLayer,
+          mutualConfig.k
+        );
+
+        if (!isMutual) {
+          console.log(`[cluster] Skipping non-mutual peer ${peer.id} (they don't have us in top-${mutualConfig.k})`);
+          continue; // Not mutual, try next peer
+        }
+
+        console.log(`[cluster] Mutual relationship confirmed with ${peer.id}`);
+      }
+
       return {
         clusterId: clusterRel.peer,
         peerId: peer.id,
@@ -162,23 +208,41 @@ export async function joinCluster(
     throw new Error(`Failed to add summarized_by: ${JSON.stringify(myUpdateError)}`);
   }
 
-  // 2. Add has_member on cluster (enables gathering)
+  // 2. Add has_member on new cluster (enables gathering)
+  // If switching clusters, also remove has_member from old cluster
   // Use fire-and-forget additive updates - handles CAS conflicts internally
-  const { error: additiveError } = await (client.api.POST as Function)('/updates/additive', {
-    body: {
-      updates: [
+  const additiveUpdates: Array<{
+    entity_id: string;
+    relationships_add?: Array<{ predicate: string; peer: string; direction: string }>;
+    relationships_remove?: Array<{ predicate: string; peer: string }>;
+  }> = [
+    {
+      entity_id: clusterId,
+      relationships_add: [
         {
-          entity_id: clusterId,
-          relationships_add: [
-            {
-              predicate: 'has_member',
-              peer: myEntityId,
-              direction: 'outgoing',
-            },
-          ],
+          predicate: 'has_member',
+          peer: myEntityId,
+          direction: 'outgoing',
         },
       ],
     },
+  ];
+
+  // Clean up old cluster's has_member relationship
+  if (oldClusterId) {
+    additiveUpdates.push({
+      entity_id: oldClusterId,
+      relationships_remove: [
+        {
+          predicate: 'has_member',
+          peer: myEntityId,
+        },
+      ],
+    });
+  }
+
+  const { error: additiveError } = await (client.api.POST as Function)('/updates/additive', {
+    body: { updates: additiveUpdates },
   });
 
   if (additiveError) {
@@ -369,7 +433,7 @@ interface EntityListResponse {
  *
  * Two-phase fallback:
  * 1. SEMANTIC FALLBACK: Search for semantically similar peers (they should be indexed now)
- *    - If found peer with cluster → join their cluster
+ *    - If found peer with cluster → join their cluster (with mutual check if enabled)
  * 2. LEXICOGRAPHIC FALLBACK (last resort): Use fast SQLite index
  *    - Sort by ID, join first peer with cluster
  *    - If I'm first in order → stay leader
@@ -381,7 +445,8 @@ export async function fallbackJoinCluster(
   myClusterId: string,
   collectionId: string,
   myLayer: number,
-  logger: KladosLogger
+  logger: KladosLogger,
+  mutualConfig?: MutualConfig
 ): Promise<FallbackResult> {
   const myEntityId = entity.id;
   logger.info('Starting fallback clustering', { myEntityId, myLayer });
@@ -411,7 +476,33 @@ export async function fallbackJoinCluster(
 
       const summarizedBy = peer.relationships.find(r => r.predicate === 'summarized_by');
       if (summarizedBy && summarizedBy.peer !== myClusterId) {
-        // Found semantically similar peer with different cluster - join them!
+        // Found semantically similar peer with different cluster
+        // Check mutual relationship if enabled
+        if (mutualConfig?.enabled) {
+          const peerEntity: EntityInfo = {
+            id: peer.id,
+            label: peer.properties?.label,
+            description: peer.properties?.description as string | undefined,
+          };
+
+          const isMutual = await isMutualPeer(
+            client,
+            mutualConfig.collection,
+            entity,
+            peerEntity,
+            mutualConfig.myLayer,
+            mutualConfig.k
+          );
+
+          if (!isMutual) {
+            logger.info('Semantic fallback: skipping non-mutual peer', { peerId: peer.id });
+            continue; // Not mutual, try next peer
+          }
+
+          logger.info('Semantic fallback: mutual relationship confirmed', { peerId: peer.id });
+        }
+
+        // Join their cluster!
         const theirClusterId = summarizedBy.peer;
         logger.info('Semantic fallback: found similar peer with cluster', {
           peerId: peer.id,
@@ -434,8 +525,90 @@ export async function fallbackJoinCluster(
   }
 
   // =========================================================================
-  // PHASE 2: LEXICOGRAPHIC FALLBACK (last resort)
+  // PHASE 1.5: RETRY SEMANTIC FALLBACK (catch late-indexing entities)
   // =========================================================================
+  // If mutual mode is enabled and first semantic check failed, wait briefly
+  // and try again. This helps catch entities that were slow to index.
+  if (mutualConfig?.enabled) {
+    const retryDelayMs = 10000; // 10 seconds
+    logger.info('Mutual mode: waiting before retry semantic check', { retryDelayMs });
+    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+
+    logger.info('Fallback phase 1.5: retry semantic search');
+
+    const retryPeers = await findSimilarPeers(
+      client,
+      collectionId,
+      entity,
+      myLayer,
+      20
+    );
+
+    logger.info('Retry semantic fallback found peers', { count: retryPeers.length });
+
+    if (retryPeers.length > 0) {
+      const peers = await fetchPeers(client, retryPeers);
+
+      for (const peer of peers) {
+        if (!peer.relationships) continue;
+
+        const summarizedBy = peer.relationships.find(r => r.predicate === 'summarized_by');
+        if (summarizedBy && summarizedBy.peer !== myClusterId) {
+          const peerEntity: EntityInfo = {
+            id: peer.id,
+            label: peer.properties?.label,
+            description: peer.properties?.description as string | undefined,
+          };
+
+          const isMutual = await isMutualPeer(
+            client,
+            mutualConfig.collection,
+            entity,
+            peerEntity,
+            mutualConfig.myLayer,
+            mutualConfig.k
+          );
+
+          if (!isMutual) {
+            logger.info('Retry semantic fallback: skipping non-mutual peer', { peerId: peer.id });
+            continue;
+          }
+
+          logger.info('Retry semantic fallback: mutual relationship confirmed', { peerId: peer.id });
+
+          const theirClusterId = summarizedBy.peer;
+          logger.info('Retry semantic fallback: found similar peer with cluster', {
+            peerId: peer.id,
+            peerLabel: peer.properties?.label,
+            theirClusterId,
+            similarity: peer.similarity,
+          });
+
+          await joinCluster(client, myEntityId, theirClusterId, myClusterId);
+          await deleteEmptyCluster(client, myClusterId);
+
+          return 'joined';
+        }
+      }
+
+      logger.info('Retry semantic fallback: still no mutual peers with clusters');
+    }
+
+    // BUG: This causes infinite recursion for solo clusters.
+    // Solo clusters return 'leader', output [clusterId], trigger describe → recurse → cluster again.
+    //
+    // TODO: The fix is NOT to fall through to lexicographic (that causes mega-clustering).
+    // Instead, we need a better termination condition:
+    // - Option 1: Dissolve if no peers found at this layer after semantic retry
+    // - Option 2: Track recursion depth and dissolve at max depth
+    // - Option 3: Check if this entity was already processed in a previous layer
+    //
+    // For now, returning 'leader' to preserve existing behavior, but this is broken
+    // for recursive workflows.
+    logger.info('Mutual mode enabled, no mutual peers found after retry - staying as leader');
+    return 'leader';
+  }
+
   logger.info('Fallback phase 2: lexicographic check');
 
   // List entities at same layer using fast SQLite index
