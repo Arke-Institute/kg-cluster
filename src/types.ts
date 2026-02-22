@@ -38,6 +38,10 @@ export interface ClusterInputProperties {
   follower_wait_max_ms?: number;
   /** Interval between follower checks (ms, default: 5000) */
   follower_poll_interval_ms?: number;
+  /** Number of top-K peers to consider for clustering (default: 15). */
+  k?: number;
+  /** Maximum cluster size before overflow to new cluster (default: 5). Acts as branching factor - hierarchy depth is log_max(N). */
+  max_cluster_size?: number;
 }
 
 /**

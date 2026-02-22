@@ -6,54 +6,54 @@ import type { ArkeClient } from '@arke-institute/sdk';
 import type { SemanticCandidate } from './types';
 
 /**
- * Semantic search response structure
- * Results have entity data directly on each item when expand=preview
+ * Collection search response structure for similarity search
+ * GET /collections/{id}/entities/search?similar_to=entityId
  */
-interface SemanticSearchResponse {
-  results: Array<{
+interface SimilaritySearchResponse {
+  collection_id: string;
+  similar_to: string;
+  entities: Array<{
     id: string;
-    type?: string;
+    type: string;
     label?: string;
     score: number;
   }>;
+  count: number;
 }
 
 /**
  * Find semantically similar entities at the same layer
  *
+ * Uses the collection search endpoint with similar_to parameter
+ * for entity-based semantic similarity search.
+ *
+ * Note: Layer filtering is done by fetching candidate entities and checking
+ * their _kg_layer property. This is necessary because the search endpoint
+ * returns similarity results across all layers.
+ *
  * @param client - Arke client
  * @param collection - Collection to search in
- * @param entity - Source entity (id, label, description)
- * @param myLayer - Current entity's _kg_layer value
+ * @param entityId - Source entity ID for similarity search
+ * @param myLayer - Current entity's _kg_layer value (for filtering)
  * @param limit - Max results (default 15)
  */
 export async function findSimilarPeers(
   client: ArkeClient,
   collection: string,
-  entity: { id: string; label?: string; description?: string },
+  entityId: string,
   myLayer: number,
   limit: number = 15
 ): Promise<SemanticCandidate[]> {
-  // Build query from label and description
-  const queryParts: string[] = [];
-  if (entity.label) queryParts.push(entity.label);
-  if (entity.description) queryParts.push(entity.description);
-  const query = queryParts.join(' ').trim();
+  // Request more results than needed since we'll filter by layer
+  const searchLimit = Math.min(limit * 3, 50);
 
-  if (!query) {
-    console.warn('[semantic] No query text for entity', entity.id);
-    return [];
-  }
-
-  // POST to semantic search endpoint with _kg_layer filter
-  // Using /search/entities for collection-scoped semantic search
-  const { data, error } = await (client.api.POST as Function)('/search/entities', {
-    body: {
-      collection_id: collection,
-      query,
-      filter: { _kg_layer: myLayer },
-      limit: limit + 1, // Extra to account for self
-      expand: 'preview', // Get id, type, label
+  const { data, error } = await client.api.GET('/collections/{id}/entities/search', {
+    params: {
+      path: { id: collection },
+      query: {
+        similar_to: entityId,
+        limit: searchLimit,
+      },
     },
   });
 
@@ -62,16 +62,40 @@ export async function findSimilarPeers(
     return [];
   }
 
-  const typedData = data as SemanticSearchResponse;
+  const typedData = data as SimilaritySearchResponse;
 
-  // Filter out self, map to candidates
-  return typedData.results
-    .filter((r) => r.id !== entity.id)
-    .map((r) => ({
-      id: r.id,
-      similarity: r.score,
-      label: r.label,
-      type: r.type,
-    }))
+  // Filter out self
+  const candidates = typedData.entities.filter((r) => r.id !== entityId);
+
+  if (candidates.length === 0) {
+    return [];
+  }
+
+  // Fetch entities in parallel to check their _kg_layer
+  const entityPromises = candidates.map(async (candidate) => {
+    try {
+      const { data: entityData, error: fetchError } = await client.api.GET('/entities/{id}', {
+        params: { path: { id: candidate.id } },
+      });
+      if (fetchError || !entityData) return null;
+
+      const props = entityData.properties as { _kg_layer?: number } | undefined;
+      if (props?._kg_layer !== myLayer) return null;
+
+      return {
+        id: candidate.id,
+        similarity: candidate.score,
+        label: candidate.label,
+        type: candidate.type,
+      };
+    } catch {
+      return null;
+    }
+  });
+
+  const results = await Promise.all(entityPromises);
+
+  return results
+    .filter((r): r is NonNullable<typeof r> => r !== null)
     .slice(0, limit);
 }

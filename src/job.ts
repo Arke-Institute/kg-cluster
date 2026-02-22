@@ -15,23 +15,35 @@ import type { Env, TargetProperties, ClusterInputProperties, EntityInfo } from '
 import { findSimilarPeers } from './semantic';
 import {
   fetchPeers,
-  findExistingCluster,
+  findJoinableCluster,
   createCluster,
   joinCluster,
+  deleteEmptyCluster,
   getClusterMemberCount,
   fallbackJoinCluster,
+  FallbackSearchConfig,
 } from './cluster';
 
 // Default wait parameters
 // INDEX_WAIT: Minimum wait for semantic indexing before searching (entities must be indexed to be found)
 // INITIAL_SPREAD: Additional random spread for staggering (creates dispersion so not all search at once)
 // Total initial delay = INDEX_WAIT + random(0, INITIAL_SPREAD) = 30-60s
-const DEFAULT_INDEX_WAIT_MS = 30000; // 30 seconds minimum - wait for semantic index
+const DEFAULT_INDEX_WAIT_MS = 90000; // 90 seconds minimum - wait for semantic index (must exceed dedupe stage duration)
 const DEFAULT_INITIAL_SPREAD_MS = 30000; // 30 seconds spread for staggering
 const DEFAULT_FOLLOWER_WAIT_MIN_MS = 30000; // 30 seconds minimum
 const DEFAULT_FOLLOWER_WAIT_MAX_MS = 60000; // 60 seconds maximum
 const DEFAULT_FOLLOWER_POLL_INTERVAL_MS = 5000; // 5 seconds
 const DEFAULT_RECHECK_DELAY_MS = 3000; // 3 seconds - delay before creating cluster to let concurrent jobs establish theirs
+const DEFAULT_NO_PEERS_RETRY_DELAY_MS = 30000; // 30 seconds - delay before retrying if no peers found (indexer lag)
+const DEFAULT_NO_PEERS_MAX_RETRIES = 2; // Maximum retries if no peers found
+
+// Size-bounded clustering parameters
+// K: Number of similar peers to fetch (default 15)
+// MAX_CLUSTER_SIZE: Soft cap on cluster members (default 5)
+// - When a cluster reaches MAX_SIZE, new entities overflow to neighboring clusters or create new ones
+// - This prevents mega-clusters while keeping the algorithm O(n) instead of O(n*k)
+const DEFAULT_K = 15;
+const DEFAULT_MAX_CLUSTER_SIZE = 5;
 
 /**
  * Generate a random wait time between min and max (jittery)
@@ -74,20 +86,20 @@ type WaitResult =
  * Wait for followers to join a newly created cluster.
  *
  * Uses jittery wait time to create natural dispersion.
- * After timeout, uses fallback clustering:
- * 1. First: Semantic search (entities should be indexed by now)
- * 2. Second: Lexicographic leader election (last resort)
+ * After timeout, uses fallback clustering with FRESH semantic search
+ * to discover late-indexed entities and find joinable clusters.
  */
 async function waitForFollowers(
   client: ArkeClient,
   logger: KladosLogger,
   entity: EntityInfo,
   clusterId: string,
-  collectionId: string,
-  myLayer: number,
   minWaitMs: number,
   maxWaitMs: number,
-  pollIntervalMs: number
+  pollIntervalMs: number,
+  peerIds: string[],
+  maxClusterSize: number,
+  searchConfig: FallbackSearchConfig
 ): Promise<WaitResult> {
   const startTime = Date.now();
   const jitteryWaitMs = getJitteryWait(minWaitMs, maxWaitMs);
@@ -113,6 +125,26 @@ async function waitForFollowers(
       return { action: 'has_followers', clusterId };
     }
 
+    // Check if peers have created joinable clusters we should join instead
+    if (peerIds.length > 0) {
+      const peerCandidates = peerIds.map((id) => ({ id, similarity: 1 }));
+      const peers = await fetchPeers(client, peerCandidates);
+      const joinable = await findJoinableCluster(client, peers, maxClusterSize);
+
+      if (joinable && joinable.clusterId !== clusterId) {
+        logger.info('Found peer cluster during wait, switching', {
+          oldClusterId: clusterId,
+          newClusterId: joinable.clusterId,
+          peerId: joinable.peerId,
+          elapsedSec: elapsed,
+        });
+
+        await joinCluster(client, entity.id, joinable.clusterId, clusterId);
+        await deleteEmptyCluster(client, clusterId);
+        return { action: 'joined' };
+      }
+    }
+
     logger.info('Still waiting for followers', {
       clusterId,
       memberCount,
@@ -120,16 +152,18 @@ async function waitForFollowers(
     });
   }
 
-  // Timeout - try fallback clustering (semantic first, then lexicographic)
-  logger.info('Timeout waiting for followers, attempting fallback clustering');
+  // Timeout - try fallback clustering with FRESH semantic search
+  // This discovers late-indexed entities that weren't found in initial search
+  logger.info('Timeout waiting for followers, attempting fallback clustering with fresh search');
 
   const fallbackResult = await fallbackJoinCluster(
     client,
     entity,
     clusterId,
-    collectionId,
-    myLayer,
-    logger
+    logger,
+    searchConfig,
+    maxClusterSize,
+    findSimilarPeers
   );
 
   switch (fallbackResult) {
@@ -160,6 +194,8 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   const followerWaitMinMs = inputProps.follower_wait_min_ms ?? DEFAULT_FOLLOWER_WAIT_MIN_MS;
   const followerWaitMaxMs = inputProps.follower_wait_max_ms ?? DEFAULT_FOLLOWER_WAIT_MAX_MS;
   const followerPollIntervalMs = inputProps.follower_poll_interval_ms ?? DEFAULT_FOLLOWER_POLL_INTERVAL_MS;
+  const k = inputProps.k ?? DEFAULT_K;
+  const maxClusterSize = inputProps.max_cluster_size ?? DEFAULT_MAX_CLUSTER_SIZE;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // STEP 0: Wait for Indexing + Staggered Start
@@ -208,59 +244,52 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   // ═══════════════════════════════════════════════════════════════════════════
   // STEP 2: Semantic Search for Similar Peers (Filtered by Layer)
   // ═══════════════════════════════════════════════════════════════════════════
-  logger.info('Searching for similar peers', { layer: myLayer });
+  logger.info('Searching for similar peers', { layer: myLayer, k, maxClusterSize });
 
-  const similarPeers = await findSimilarPeers(
+  // Build entity info for this target
+  const myEntity: EntityInfo = {
+    id: target.id,
+    label: properties.label,
+    description: properties.description as string | undefined,
+  };
+
+  let similarPeers = await findSimilarPeers(
     client,
     request.target_collection,
-    {
-      id: target.id,
-      label: properties.label,
-      description: properties.description as string | undefined,
-    },
+    target.id,
     myLayer,
-    5 // Smaller K creates more distinct clusters
+    k
   );
 
+  // Retry if no peers found (semantic indexer may have lag)
   if (similarPeers.length === 0) {
-    // No similar peers - create cluster and wait for potential followers
-    logger.info('No similar peers found, creating cluster and waiting for followers');
+    for (let retry = 1; retry <= DEFAULT_NO_PEERS_MAX_RETRIES; retry++) {
+      logger.info('No peers found, waiting for indexer and retrying', {
+        retry,
+        maxRetries: DEFAULT_NO_PEERS_MAX_RETRIES,
+        delayMs: DEFAULT_NO_PEERS_RETRY_DELAY_MS,
+      });
+      await sleep(DEFAULT_NO_PEERS_RETRY_DELAY_MS);
 
-    const clusterId = await createCluster(
-      client,
-      request.target_collection,
-      target.id,
-      myLayer
-    );
-    await joinCluster(client, target.id, clusterId);
+      similarPeers = await findSimilarPeers(
+        client,
+        request.target_collection,
+        target.id,
+        myLayer,
+        k
+      );
 
-    // Wait for followers, with fallback clustering on timeout
-    const result = await waitForFollowers(
-      client,
-      logger,
-      { id: target.id, label: properties.label, description: properties.description as string | undefined },
-      clusterId,
-      request.target_collection,
-      myLayer,
-      followerWaitMinMs,
-      followerWaitMaxMs,
-      followerPollIntervalMs
-    );
-
-    switch (result.action) {
-      case 'has_followers':
-        logger.success('Cluster has followers, propagating', { clusterId: result.clusterId });
-        return { outputs: [result.clusterId] };
-      case 'leader':
-        logger.success('Became leader via fallback, propagating', { clusterId: result.clusterId });
-        return { outputs: [result.clusterId] };
-      case 'joined':
-        logger.success('Joined existing cluster via fallback');
-        return { outputs: [] };
-      case 'dissolved':
-        logger.success('Dissolved - only entity at this layer');
-        return { outputs: [] };
+      if (similarPeers.length > 0) {
+        logger.info('Found peers on retry', { retry, count: similarPeers.length });
+        break;
+      }
     }
+  }
+
+  if (similarPeers.length === 0) {
+    // No similar peers after retries - terminate as singleton (truly alone)
+    logger.info('No similar peers found after retries, terminating as singleton');
+    return { outputs: [] };
   }
 
   logger.info('Found similar peers', { count: similarPeers.length });
@@ -274,46 +303,50 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   logger.info('Fetched peers', { count: peers.length });
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STEP 4: Check for Clustered Peers (summarized_by)
+  // STEP 4: Find Joinable Cluster (Size-Bounded)
   // ═══════════════════════════════════════════════════════════════════════════
+  // Check peers (sorted by similarity) for one with a cluster that has room.
+  // The size cap prevents mega-clusters while keeping the algorithm O(n).
+  logger.info('Looking for joinable cluster');
 
-  const existingCluster = findExistingCluster(peers);
+  const peerIds = peers.map((p) => p.id);
+  const joinable = await findJoinableCluster(client, peers, maxClusterSize);
 
-  if (existingCluster) {
-    logger.info('Found existing cluster via peer', {
-      clusterId: existingCluster.clusterId,
-      peerId: existingCluster.peerId,
+  if (joinable) {
+    logger.info('Found joinable cluster via peer', {
+      clusterId: joinable.clusterId,
+      peerId: joinable.peerId,
     });
 
-    await joinCluster(client, target.id, existingCluster.clusterId);
+    await joinCluster(client, target.id, joinable.clusterId);
     logger.success('Joined existing cluster', {
-      clusterId: existingCluster.clusterId,
+      clusterId: joinable.clusterId,
     });
 
-    // No handoff to describe - just complete
     return { outputs: [] };
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // STEP 5: Re-check After Delay (Race Condition Mitigation)
   // ═══════════════════════════════════════════════════════════════════════════
-  // Wait briefly and re-check peers - concurrent cluster jobs may have established their clusters
-  logger.info('No existing cluster found, waiting before re-check', { delayMs: DEFAULT_RECHECK_DELAY_MS });
+  // Wait briefly and re-check peers - concurrent jobs may have created clusters
+  logger.info('No cluster found, waiting before re-check', { delayMs: DEFAULT_RECHECK_DELAY_MS });
   await sleep(DEFAULT_RECHECK_DELAY_MS);
 
-  // Re-fetch peers to check if any now have summarized_by
-  const recheckPeers = await fetchPeers(client, similarPeers);
-  const recheckCluster = findExistingCluster(recheckPeers);
+  // Re-fetch peers to check cluster status
+  const recheckCandidates = peerIds.map((id) => ({ id, similarity: 1 }));
+  const recheckPeers = await fetchPeers(client, recheckCandidates);
+  const recheckJoinable = await findJoinableCluster(client, recheckPeers, maxClusterSize);
 
-  if (recheckCluster) {
+  if (recheckJoinable) {
     logger.info('Found cluster on re-check', {
-      clusterId: recheckCluster.clusterId,
-      peerId: recheckCluster.peerId,
+      clusterId: recheckJoinable.clusterId,
+      peerId: recheckJoinable.peerId,
     });
 
-    await joinCluster(client, target.id, recheckCluster.clusterId);
+    await joinCluster(client, target.id, recheckJoinable.clusterId);
     logger.success('Joined existing cluster after re-check', {
-      clusterId: recheckCluster.clusterId,
+      clusterId: recheckJoinable.clusterId,
     });
 
     return { outputs: [] };
@@ -322,7 +355,7 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   // ═══════════════════════════════════════════════════════════════════════════
   // STEP 6: Create Own Cluster and Wait for Followers
   // ═══════════════════════════════════════════════════════════════════════════
-  logger.info('Still no existing cluster after re-check, creating new cluster');
+  logger.info('No existing cluster after re-check, creating new cluster');
 
   const clusterId = await createCluster(
     client,
@@ -332,17 +365,25 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   );
   await joinCluster(client, target.id, clusterId);
 
+  // Build search config for fallback (fresh semantic search)
+  const searchConfig: FallbackSearchConfig = {
+    collection: request.target_collection,
+    myLayer,
+    k,
+  };
+
   // Wait for followers, with fallback clustering on timeout
   const result = await waitForFollowers(
     client,
     logger,
-    { id: target.id, label: properties.label, description: properties.description as string | undefined },
+    myEntity,
     clusterId,
-    request.target_collection,
-    myLayer,
     followerWaitMinMs,
     followerWaitMaxMs,
-    followerPollIntervalMs
+    followerPollIntervalMs,
+    peerIds,
+    maxClusterSize,
+    searchConfig
   );
 
   switch (result.action) {
