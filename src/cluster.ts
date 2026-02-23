@@ -221,6 +221,71 @@ export async function joinCluster(
 }
 
 /**
+ * Leave a cluster (remove relationships).
+ * Used when post-join size check shows we caused overflow.
+ */
+export async function leaveCluster(
+  client: ArkeClient,
+  myEntityId: string,
+  clusterId: string
+): Promise<void> {
+  console.log(`[cluster] ${myEntityId} leaving ${clusterId}`);
+
+  // 1. Remove summarized_by from self
+  const { data: myTip, error: myTipError } = await client.api.GET('/entities/{id}/tip', {
+    params: { path: { id: myEntityId } },
+  });
+
+  if (myTipError || !myTip) {
+    console.error(`[cluster] Failed to get tip for ${myEntityId}: ${JSON.stringify(myTipError)}`);
+    return;
+  }
+
+  const { error: removeError } = await client.api.PUT('/entities/{id}', {
+    params: { path: { id: myEntityId } },
+    body: {
+      expect_tip: myTip.cid,
+      relationships_remove: [
+        {
+          predicate: 'summarized_by',
+          peer: clusterId,
+        },
+      ],
+    },
+  });
+
+  if (removeError) {
+    console.error(`[cluster] Failed to remove summarized_by: ${JSON.stringify(removeError)}`);
+  }
+
+  // 2. Remove has_member from cluster
+  try {
+    const { data: clusterTip } = await client.api.GET('/entities/{id}/tip', {
+      params: { path: { id: clusterId } },
+    });
+
+    if (clusterTip) {
+      await client.api.PUT('/entities/{id}', {
+        params: { path: { id: clusterId } },
+        body: {
+          expect_tip: clusterTip.cid,
+          relationships_remove: [
+            {
+              predicate: 'has_member',
+              peer: myEntityId,
+            },
+          ],
+        },
+      });
+    }
+  } catch (e) {
+    console.error(`[cluster] Failed to remove has_member from cluster: ${e}`);
+  }
+
+  console.log(`[cluster] ${myEntityId} left ${clusterId}`);
+}
+
+/**
  * Get the number of members in a cluster
  */
 export async function getClusterMemberCount(
@@ -304,21 +369,33 @@ export async function dissolveCluster(
 }
 
 /**
- * Delete an empty cluster entity (when switching to another cluster)
+ * Try to delete a cluster entity that should be empty (when switching to another cluster).
+ *
+ * Returns true if deletion succeeded, false if cluster has other members.
+ * Checks member count first, then uses CAS delete as a safety net.
  */
-export async function deleteEmptyCluster(
+export async function tryDeleteEmptyCluster(
   client: ArkeClient,
-  clusterId: string
-): Promise<void> {
-  console.log(`[cluster] Deleting empty cluster ${clusterId}`);
+  clusterId: string,
+  myEntityId: string
+): Promise<boolean> {
+  console.log(`[cluster] Attempting to delete cluster ${clusterId}`);
 
+  // First check member count - if others have joined, don't delete
+  const memberCount = await getClusterMemberCount(client, clusterId);
+  if (memberCount > 1) {
+    console.log(`[cluster] Cluster ${clusterId} has ${memberCount} members, not deleting`);
+    return false;
+  }
+
+  // Only we're in the cluster (or it's empty), try to delete with CAS
   const { data: tip, error: tipError } = await client.api.GET('/entities/{id}/tip', {
     params: { path: { id: clusterId } },
   });
 
   if (tipError || !tip) {
     console.error(`[cluster] Failed to get tip for cluster ${clusterId}: ${JSON.stringify(tipError)}`);
-    return;
+    return false;
   }
 
   const { error: deleteError } = await client.api.DELETE('/entities/{id}', {
@@ -327,10 +404,13 @@ export async function deleteEmptyCluster(
   });
 
   if (deleteError) {
-    console.error(`[cluster] Failed to delete cluster ${clusterId}: ${JSON.stringify(deleteError)}`);
-  } else {
-    console.log(`[cluster] Deleted empty cluster ${clusterId}`);
+    // CAS failure - someone joined between our check and delete
+    console.log(`[cluster] Delete failed for ${clusterId} (concurrent join): ${JSON.stringify(deleteError)}`);
+    return false;
   }
+
+  console.log(`[cluster] Deleted empty cluster ${clusterId}`);
+  return true;
 }
 
 /**
@@ -394,13 +474,23 @@ export async function fallbackJoinCluster(
   const joinable = await findJoinableCluster(client, peers, maxClusterSize);
 
   if (joinable && joinable.clusterId !== myClusterId) {
-    logger.info('Fallback: found joinable cluster via fresh search', {
-      clusterId: joinable.clusterId,
+    // Try to delete our cluster first - if others joined, we should stay as leader
+    const deleted = await tryDeleteEmptyCluster(client, myClusterId, myEntityId);
+
+    if (!deleted) {
+      logger.info('Fallback: cluster has members, staying as leader', {
+        clusterId: myClusterId,
+      });
+      return 'leader';
+    }
+
+    logger.info('Fallback: deleted empty cluster, joining peer cluster', {
+      oldClusterId: myClusterId,
+      newClusterId: joinable.clusterId,
       peerId: joinable.peerId,
     });
 
-    await joinCluster(client, myEntityId, joinable.clusterId, myClusterId);
-    await deleteEmptyCluster(client, myClusterId);
+    await joinCluster(client, myEntityId, joinable.clusterId);
     return 'joined';
   }
 
@@ -422,12 +512,22 @@ export async function fallbackJoinCluster(
   const retryJoinable = await findJoinableCluster(client, retryPeers, maxClusterSize);
 
   if (retryJoinable && retryJoinable.clusterId !== myClusterId) {
-    logger.info('Fallback retry: found joinable cluster', {
-      clusterId: retryJoinable.clusterId,
+    // Try to delete our cluster first - if others joined, we should stay as leader
+    const deleted = await tryDeleteEmptyCluster(client, myClusterId, myEntityId);
+
+    if (!deleted) {
+      logger.info('Fallback retry: cluster has members, staying as leader', {
+        clusterId: myClusterId,
+      });
+      return 'leader';
+    }
+
+    logger.info('Fallback retry: deleted empty cluster, joining peer cluster', {
+      oldClusterId: myClusterId,
+      newClusterId: retryJoinable.clusterId,
     });
 
-    await joinCluster(client, myEntityId, retryJoinable.clusterId, myClusterId);
-    await deleteEmptyCluster(client, myClusterId);
+    await joinCluster(client, myEntityId, retryJoinable.clusterId);
     return 'joined';
   }
 

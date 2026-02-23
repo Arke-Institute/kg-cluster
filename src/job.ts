@@ -18,7 +18,8 @@ import {
   findJoinableCluster,
   createCluster,
   joinCluster,
-  deleteEmptyCluster,
+  leaveCluster,
+  tryDeleteEmptyCluster,
   getClusterMemberCount,
   fallbackJoinCluster,
   FallbackSearchConfig,
@@ -132,15 +133,28 @@ async function waitForFollowers(
       const joinable = await findJoinableCluster(client, peers, maxClusterSize);
 
       if (joinable && joinable.clusterId !== clusterId) {
-        logger.info('Found peer cluster during wait, switching', {
+        // Before switching, verify no one joined our cluster while we were searching
+        // Try to delete our cluster first - if it has other members, we should stay as leader
+        const deleted = await tryDeleteEmptyCluster(client, clusterId, entity.id);
+
+        if (!deleted) {
+          // Delete failed = cluster was modified = someone joined = stay as leader
+          logger.info('Cannot delete cluster (has members), staying as leader', {
+            clusterId,
+            elapsedSec: elapsed,
+          });
+          return { action: 'has_followers', clusterId };
+        }
+
+        // Delete succeeded = we were alone = safe to switch
+        logger.info('Deleted empty cluster, joining peer cluster', {
           oldClusterId: clusterId,
           newClusterId: joinable.clusterId,
           peerId: joinable.peerId,
           elapsedSec: elapsed,
         });
 
-        await joinCluster(client, entity.id, joinable.clusterId, clusterId);
-        await deleteEmptyCluster(client, clusterId);
+        await joinCluster(client, entity.id, joinable.clusterId);
         return { action: 'joined' };
       }
     }
@@ -319,11 +333,24 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     });
 
     await joinCluster(client, target.id, joinable.clusterId);
-    logger.success('Joined existing cluster', {
-      clusterId: joinable.clusterId,
-    });
 
-    return { outputs: [] };
+    // Post-join size check - if we caused overflow, leave and create our own cluster
+    const newSize = await getClusterMemberCount(client, joinable.clusterId);
+    if (newSize > maxClusterSize) {
+      logger.info('Cluster overflowed after join, leaving to create own cluster', {
+        clusterId: joinable.clusterId,
+        size: newSize,
+        maxSize: maxClusterSize,
+      });
+      // Leave this cluster - we'll create our own below
+      await leaveCluster(client, target.id, joinable.clusterId);
+    } else {
+      logger.success('Joined existing cluster', {
+        clusterId: joinable.clusterId,
+        size: newSize,
+      });
+      return { outputs: [] };
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -345,11 +372,23 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     });
 
     await joinCluster(client, target.id, recheckJoinable.clusterId);
-    logger.success('Joined existing cluster after re-check', {
-      clusterId: recheckJoinable.clusterId,
-    });
 
-    return { outputs: [] };
+    // Post-join size check
+    const newSize = await getClusterMemberCount(client, recheckJoinable.clusterId);
+    if (newSize > maxClusterSize) {
+      logger.info('Cluster overflowed after re-check join, leaving to create own cluster', {
+        clusterId: recheckJoinable.clusterId,
+        size: newSize,
+        maxSize: maxClusterSize,
+      });
+      await leaveCluster(client, target.id, recheckJoinable.clusterId);
+    } else {
+      logger.success('Joined existing cluster after re-check', {
+        clusterId: recheckJoinable.clusterId,
+        size: newSize,
+      });
+      return { outputs: [] };
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
