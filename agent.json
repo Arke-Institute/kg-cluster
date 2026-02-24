@@ -1,14 +1,374 @@
 {
+  "schema_version": "1.0",
+
   "label": "KG Cluster",
-  "description": "Clusters semantically similar entities using relationship-based discovery. Checks peers for summarized_by relationships to find existing clusters, or creates new clusters.",
+  "description": "Clusters semantically similar entities into hierarchical groups using relationship-based discovery and size-bounded clustering.",
+
+  "detailed_description": "## Overview\n\nKG Cluster implements a distributed clustering algorithm that groups semantically similar entities into a hierarchy. It uses Arke's semantic search API to find similar peers, then uses a \"relationship-based discovery\" pattern to either join existing clusters or create new ones.\n\n## Algorithm: Relationship-Based Discovery\n\n1. **Initial delay** - Wait for semantic indexer (90s default) plus random spread (0-30s) to stagger concurrent jobs\n2. **Semantic search** - Find K similar peers at the same layer using vector similarity\n3. **Fetch peers** - Get peer entities in parallel to check their relationships\n4. **Join or create** - If a peer has a `summarized_by` relationship to a non-full cluster, join it. Otherwise create a new cluster.\n5. **Wait for followers** - If creating a cluster, wait for other entities to join before propagating\n6. **Fallback clustering** - On timeout, do a fresh semantic search to find late-indexed entities and potentially join their clusters\n\n## Key Concepts\n\n### Layers (`_kg_layer`)\nEntities have a `_kg_layer` property that tracks hierarchy depth. Base entities are layer 0, their clusters are layer 1, meta-clusters are layer 2, etc. Clustering only considers peers at the same layer.\n\n### Size Bounding\nClusters are soft-capped at `max_cluster_size` (default 5). When a cluster is full, new entities must create their own cluster or join a different one. This creates a balanced hierarchy with depth log_max(N).\n\n### Relationships\n- `summarized_by` - Member entity -> cluster (enables discovery)\n- `has_member` - Cluster -> member entity (enables traversal)\n\n## When to Use\n\n- After entity extraction to organize entities hierarchically\n- After deduplication to build a topic taxonomy\n- In recursive workflows to build multi-level hierarchies\n\n## Limitations\n\n- Requires entities to be semantically indexed (90s default wait)\n- Best with 10+ entities per collection for meaningful clusters\n- Race conditions are mitigated but not eliminated (concurrent jobs may create redundant clusters)",
+
   "endpoint": "https://kg-cluster.nick-chimicles-professional.workers.dev",
   "actions_required": ["entity:view", "entity:create", "entity:update"],
-  "accepts": {
-    "types": ["*"],
+
+  "input": {
+    "entity": {
+      "types": ["*"],
+      "types_description": "Any entity that has been semantically indexed. Works best with entities that have meaningful label and description properties for similarity matching. Typically receives extracted entities or cluster_leader entities from previous clustering iterations.",
+
+      "properties": {
+        "required": {},
+        "optional": {
+          "label": {
+            "type": "string",
+            "description": "Entity name used for semantic similarity matching. More descriptive labels produce better clustering."
+          },
+          "description": {
+            "type": "string",
+            "description": "Entity description used for semantic similarity matching. Detailed descriptions improve clustering quality."
+          },
+          "_kg_layer": {
+            "type": "integer",
+            "description": "Hierarchy layer (0 = base entities, 1+ = clusters). Used to find peers at the same level. Defaults to 0 if not present.",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
+
+      "file": {
+        "required": false,
+        "description": "Not used. Clustering is based on entity metadata (label, description), not file content."
+      },
+
+      "relationships": {
+        "required": {},
+        "optional": {
+          "summarized_by": {
+            "target_types": ["cluster_leader"],
+            "description": "If entity already has a summarized_by relationship, it's already clustered. The clustering algorithm checks peers for this relationship to find joinable clusters."
+          }
+        }
+      }
+    },
+
+    "klados_input": {
+      "description": "Configurable parameters for clustering behavior. All have sensible defaults.",
+      "properties": {
+        "optional": {
+          "index_wait_ms": {
+            "type": "integer",
+            "description": "Minimum wait time for semantic indexing before searching (ms). Entities must be indexed to be found via similarity search.",
+            "default": 90000,
+            "minimum": 0
+          },
+          "initial_spread_ms": {
+            "type": "integer",
+            "description": "Additional random spread for staggering concurrent job starts (ms). Total initial delay = index_wait_ms + random(0, initial_spread_ms).",
+            "default": 30000,
+            "minimum": 0
+          },
+          "follower_wait_min_ms": {
+            "type": "integer",
+            "description": "Minimum time to wait for followers after creating a cluster (ms). Uses jittery wait between min and max.",
+            "default": 30000,
+            "minimum": 0
+          },
+          "follower_wait_max_ms": {
+            "type": "integer",
+            "description": "Maximum time to wait for followers after creating a cluster (ms).",
+            "default": 60000,
+            "minimum": 0
+          },
+          "follower_poll_interval_ms": {
+            "type": "integer",
+            "description": "Interval between checks for new followers (ms).",
+            "default": 5000,
+            "minimum": 1000
+          },
+          "k": {
+            "type": "integer",
+            "description": "Number of similar peers to consider for clustering. Higher K finds more potential clusters but increases API calls.",
+            "default": 15,
+            "minimum": 1,
+            "maximum": 50
+          },
+          "max_cluster_size": {
+            "type": "integer",
+            "description": "Soft cap on cluster members before overflow. Acts as branching factor - hierarchy depth is log_max(N). Smaller values create deeper, more specific hierarchies.",
+            "default": 5,
+            "minimum": 2,
+            "maximum": 50
+          }
+        }
+      }
+    },
+
     "cardinality": "one"
   },
-  "produces": {
-    "types": ["cluster_leader"],
-    "cardinality": "one"
+
+  "output": {
+    "entities": {
+      "creates": {
+        "types": ["cluster_leader"],
+        "types_description": "A cluster_leader entity representing a group of semantically similar entities. Only created if the entity becomes a cluster leader (no joinable cluster found).",
+
+        "properties": {
+          "guaranteed": {
+            "label": {
+              "type": "string",
+              "description": "Temporary label in format 'cluster_{anchor_entity_id}'. Should be replaced with a descriptive label by a downstream Describe klados."
+            },
+            "_kg_layer": {
+              "type": "integer",
+              "description": "Hierarchy layer, always input entity's layer + 1. Base entities (layer 0) create layer 1 clusters, etc."
+            }
+          },
+          "conditional": {}
+        },
+
+        "relationships": {
+          "has_member": {
+            "target": "member entities",
+            "direction": "outgoing",
+            "cardinality": "many",
+            "description": "Links cluster to all its member entities. Added when entities join via summarized_by."
+          }
+        }
+      },
+
+      "modifies": {
+        "target": "input entity",
+        "description": "The input entity is updated to link it to its cluster (either joined or created).",
+        "relationships": {
+          "summarized_by": {
+            "target": "cluster_leader entity",
+            "direction": "outgoing",
+            "description": "Links member entity to its cluster. This relationship enables discovery - other entities find joinable clusters by checking peers' summarized_by relationships."
+          }
+        }
+      }
+    },
+
+    "handoff": {
+      "outputs": "ID of created cluster_leader (if became leader with followers), or empty array (if joined existing cluster or dissolved)",
+      "description": "Only propagates cluster ID when this entity became a cluster leader with at least one follower. This triggers the Describe klados to generate a description for the new cluster. Returns empty if: (1) joined an existing cluster, (2) no similar peers found (singleton), (3) dissolved after fallback."
+    },
+
+    "cardinality": "zero_or_one"
+  },
+
+  "behavior": {
+    "processing": {
+      "tier": 2,
+      "tier_description": "Durable Object based with SQL state persistence. Jobs survive worker restarts and can handle long wait times (90s+ for indexing, 30-60s for followers).",
+      "typical_duration": "2-4 minutes total: 90s index wait + 30s spread + 30-60s follower wait + API calls",
+      "idempotent": true,
+      "idempotent_description": "Re-invoking on same job_id is idempotent (DO returns immediately if already started). However, re-clustering an entity that's already clustered will add it to another cluster."
+    },
+
+    "constraints": {
+      "semantic_indexing": "Entities must be semantically indexed before clustering. Default 90s wait handles this, but can be adjusted via index_wait_ms if indexer is faster/slower.",
+      "minimum_entities": "At least 2 similar entities needed for meaningful clustering. Single entities terminate as singletons (no cluster created).",
+      "rate_limits": "Makes ~K entity fetches per job (K=15 default). Safe to run in parallel - each job gets its own DO instance.",
+      "concurrency": "Designed for high concurrency. Staggered starts (initial_spread_ms) and CAS-safe updates prevent most race conditions."
+    },
+
+    "error_handling": {
+      "no_target_entity": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "No target_entity in request"
+      },
+      "entity_fetch_failed": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "Failed to fetch target: {entity_id}"
+      },
+      "no_similar_peers": {
+        "behavior": "Terminates as singleton (no cluster created)",
+        "log_status": "done",
+        "output": "Empty outputs array"
+      },
+      "all_clusters_full": {
+        "behavior": "Creates new cluster",
+        "log_status": "done",
+        "output": "New cluster ID if followers join, empty if not"
+      },
+      "cluster_creation_failed": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "Failed to create cluster"
+      },
+      "timeout_no_followers": {
+        "behavior": "Attempts fallback clustering with fresh semantic search, may dissolve cluster if truly alone",
+        "log_status": "done",
+        "output": "Depends on fallback result"
+      }
+    },
+
+    "side_effects": [
+      "Creates cluster_leader entities in target_collection",
+      "Updates input entity with summarized_by relationship to cluster",
+      "Updates cluster with has_member relationship to input entity",
+      "May delete empty clusters during fallback (CAS-safe)",
+      "Uses semantic search API (vector similarity)"
+    ]
+  },
+
+  "examples": [
+    {
+      "name": "Join existing cluster",
+      "description": "Entity finds a similar peer that's already in a cluster with room, and joins it",
+
+      "input": {
+        "entity": {
+          "id": "ENTITY_APPLE",
+          "type": "concept",
+          "properties": {
+            "label": "Apple Inc.",
+            "description": "American technology company that designs consumer electronics and software.",
+            "_kg_layer": 0
+          }
+        },
+        "klados_input": {}
+      },
+
+      "output": {
+        "entities_created": [],
+        "entities_modified": [
+          {
+            "id": "ENTITY_APPLE",
+            "relationships_added": {
+              "summarized_by": "CLUSTER_TECH_COMPANIES"
+            }
+          },
+          {
+            "id": "CLUSTER_TECH_COMPANIES",
+            "relationships_added": {
+              "has_member": "ENTITY_APPLE"
+            }
+          }
+        ],
+        "handoff_outputs": []
+      },
+
+      "notes": "Semantic search found 'Microsoft' and 'Google' as similar peers. Microsoft had summarized_by → CLUSTER_TECH_COMPANIES which had 3 members (under max_cluster_size=5). Entity joined that cluster."
+    },
+    {
+      "name": "Create new cluster as leader",
+      "description": "No joinable cluster found, entity creates its own cluster and followers join",
+
+      "input": {
+        "entity": {
+          "id": "ENTITY_SATURN",
+          "type": "place",
+          "properties": {
+            "label": "Saturn",
+            "description": "Sixth planet from the Sun, known for its prominent ring system.",
+            "_kg_layer": 0
+          }
+        },
+        "klados_input": {
+          "max_cluster_size": 5
+        }
+      },
+
+      "output": {
+        "entities_created": [
+          {
+            "type": "cluster_leader",
+            "properties": {
+              "label": "cluster_ENTITY_SATURN",
+              "_kg_layer": 1
+            }
+          }
+        ],
+        "entities_modified": [
+          {
+            "id": "ENTITY_SATURN",
+            "relationships_added": {
+              "summarized_by": "CLUSTER_ABC"
+            }
+          }
+        ],
+        "handoff_outputs": ["CLUSTER_ABC"]
+      },
+
+      "notes": "Semantic search found Jupiter, Mars, and Neptune as similar peers, but none had clusters yet. Entity created CLUSTER_ABC. Jupiter joined during follower wait (memberCount > 1), so cluster ID propagates to Describe."
+    },
+    {
+      "name": "Singleton termination",
+      "description": "No similar peers found, entity terminates without clustering",
+
+      "input": {
+        "entity": {
+          "id": "ENTITY_UNIQUE",
+          "type": "concept",
+          "properties": {
+            "label": "Quantum Chromodynamics",
+            "description": "Fundamental theory of strong interactions between quarks and gluons.",
+            "_kg_layer": 0
+          }
+        },
+        "klados_input": {}
+      },
+
+      "output": {
+        "entities_created": [],
+        "entities_modified": [],
+        "handoff_outputs": []
+      },
+
+      "notes": "Semantic search returned 0 peers after retries. Entity is semantically unique in this collection. No cluster created, no handoff."
+    }
+  ],
+
+  "metadata": {
+    "version": "1.0.0",
+    "author": "Arke Institute",
+
+    "tags": ["knowledge-graph", "clustering", "semantic-search", "hierarchy", "tier-2", "distributed"],
+
+    "related_kladoi": {
+      "prerequisites": [
+        {
+          "label": "KG Extractor",
+          "description": "Extract entities from text before clustering.",
+          "when": "Starting from raw text documents."
+        },
+        {
+          "label": "KG Dedupe Resolver",
+          "description": "Deduplicate entities before clustering.",
+          "when": "Processing multiple documents that may mention the same entities."
+        }
+      ],
+      "often_used_with": [
+        {
+          "label": "Describe",
+          "description": "Generate descriptive labels and descriptions for cluster_leader entities.",
+          "when": "After clustering, to replace temporary 'cluster_{id}' labels with meaningful names."
+        },
+        {
+          "label": "KG Cluster (recursive)",
+          "description": "The same klados can be applied to cluster_leader entities to build deeper hierarchies.",
+          "when": "Building multi-level taxonomies where clusters themselves should be grouped."
+        }
+      ],
+      "workflows": [
+        {
+          "label": "scatter-kg",
+          "description": "Full extraction pipeline: scatter -> extract -> dedupe -> cluster -> describe"
+        },
+        {
+          "label": "scatter-kg-recursive",
+          "description": "Recursive clustering variant that applies clustering repeatedly to build arbitrarily deep hierarchies"
+        }
+      ]
+    },
+
+    "costs": {
+      "api_calls": "~K+3 entity fetches per invocation (K similar peers + target + cluster operations)",
+      "typical_tokens": "No LLM calls - pure algorithmic clustering using vector similarity",
+      "estimated_cost": "$0.001-0.005 per entity (Arke API calls only, no LLM costs)"
+    }
   }
 }
