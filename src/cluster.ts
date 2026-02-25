@@ -372,7 +372,7 @@ export async function dissolveCluster(
  * Try to delete a cluster entity that should be empty (when switching to another cluster).
  *
  * Returns true if deletion succeeded, false if cluster has other members.
- * Checks member count first, then uses CAS delete as a safety net.
+ * Uses single fetch for both member count AND CAS tip to prevent TOCTOU race.
  */
 export async function tryDeleteEmptyCluster(
   client: ArkeClient,
@@ -381,30 +381,36 @@ export async function tryDeleteEmptyCluster(
 ): Promise<boolean> {
   console.log(`[cluster] Attempting to delete cluster ${clusterId}`);
 
-  // First check member count - if others have joined, don't delete
-  const memberCount = await getClusterMemberCount(client, clusterId);
-  if (memberCount > 1) {
-    console.log(`[cluster] Cluster ${clusterId} has ${memberCount} members, not deleting`);
-    return false;
-  }
-
-  // Only we're in the cluster (or it's empty), try to delete with CAS
-  const { data: tip, error: tipError } = await client.api.GET('/entities/{id}/tip', {
+  // Single fetch for BOTH member count AND CAS tip - prevents race condition
+  // If we fetched member count separately, members could join before we get the tip,
+  // causing us to delete a cluster that now has members.
+  const { data: cluster, error: fetchError } = await client.api.GET('/entities/{id}', {
     params: { path: { id: clusterId } },
   });
 
-  if (tipError || !tip) {
-    console.error(`[cluster] Failed to get tip for cluster ${clusterId}: ${JSON.stringify(tipError)}`);
+  if (fetchError || !cluster) {
+    console.error(`[cluster] Failed to fetch cluster ${clusterId}: ${JSON.stringify(fetchError)}`);
     return false;
   }
 
+  // Check member count from THIS fetch
+  const members = (cluster.relationships || []).filter(
+    (r) => r.predicate === 'has_member'
+  );
+
+  if (members.length > 1) {
+    console.log(`[cluster] Cluster ${clusterId} has ${members.length} members, not deleting`);
+    return false;
+  }
+
+  // Delete using CID from THIS fetch - if anyone joined after our fetch, CAS will fail
   const { error: deleteError } = await client.api.DELETE('/entities/{id}', {
     params: { path: { id: clusterId } },
-    body: { expect_tip: tip.cid },
+    body: { expect_tip: cluster.cid },
   });
 
   if (deleteError) {
-    // CAS failure - someone joined between our check and delete
+    // CAS failure - someone joined between our fetch and delete
     console.log(`[cluster] Delete failed for ${clusterId} (concurrent join): ${JSON.stringify(deleteError)}`);
     return false;
   }
