@@ -18,6 +18,7 @@ import {
   getStateFilePath,
   findWorkspaceConfig,
   resolveWorkspaceCollection,
+  migrateKladosToCollection,
   type KladosConfig,
   type KladosRegistrationState,
   type DryRunResult,
@@ -127,9 +128,10 @@ async function main() {
   const isProduction =
     process.argv.includes('--production') || process.argv.includes('--prod');
   const isDryRun = process.argv.includes('--dry-run');
+  const migrateCollection = process.argv.includes('--migrate-collection');
   const network = isProduction ? 'main' : 'test';
 
-  console.log(`\n📦 KG Cluster Registration (${network} network)${isDryRun ? ' [DRY RUN]' : ''}\n`);
+  console.log(`\n📦 KG Cluster Registration (${network} network)${isDryRun ? ' [DRY RUN]' : ''}${migrateCollection ? ' [MIGRATE]' : ''}\n`);
 
   if (!existsSync('agent.json')) {
     console.error('Error: agent.json not found');
@@ -156,6 +158,7 @@ async function main() {
   // Check for workspace config (shared collection across kladoi)
   const workspace = findWorkspaceConfig();
   let collectionId: string | undefined;
+  let updatedState = state;
 
   if (workspace) {
     console.log(`Found workspace config: ${workspace.path}`);
@@ -165,20 +168,37 @@ async function main() {
       if (!resolved.created) {
         console.log(`Using workspace collection: ${collectionId}`);
       }
+
+      // Handle --migrate-collection: move existing klados to workspace collection
+      if (migrateCollection && state && state.collection_id !== collectionId) {
+        console.log(`\nMigrating klados from ${state.collection_id} to ${collectionId}...`);
+        await migrateKladosToCollection(client, state.klados_id, state.collection_id, collectionId);
+        updatedState = { ...state, collection_id: collectionId, updated_at: new Date().toISOString() };
+        writeState(stateFile, updatedState);
+        console.log(`  Updated local state`);
+      } else if (migrateCollection && state && state.collection_id === collectionId) {
+        console.log(`Klados already in workspace collection`);
+      }
     } else {
       const networkConfig = workspace.config[network];
       if (networkConfig.collection_id) {
         collectionId = networkConfig.collection_id;
         console.log(`Would use workspace collection: ${collectionId}`);
+        if (migrateCollection && state && state.collection_id !== collectionId) {
+          console.log(`Would migrate klados from ${state.collection_id} to ${collectionId}`);
+        }
       } else {
         console.log(`Would create workspace collection: ${networkConfig.collection_label}`);
       }
     }
     console.log('');
+  } else if (migrateCollection) {
+    console.warn('Warning: --migrate-collection requires a workspace config (.arke-workspace.json)');
+    console.log('');
   }
 
   try {
-    const result = await syncKlados(client, config, state, {
+    const result = await syncKlados(client, config, updatedState, {
       network,
       collectionId,
       keyStore,

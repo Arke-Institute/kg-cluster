@@ -13,7 +13,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@arke-institute/rhiza": "^0.7.2",
+    "@arke-institute/rhiza": "^0.7.10",
     "@arke-institute/sdk": "^3.6.6",
     "hono": "^4.0.0"
   },
@@ -25,6 +25,6 @@
     "typescript": "^5.7.2",
     "vite": "^7.3.1",
     "vitest": "^2.0.0",
-    "wrangler": "^3.99.0"
+    "wrangler": "^4.68.1"
   }
 }

@@ -6,12 +6,26 @@
  * Worker environment bindings
  */
 export interface Env {
+  // Default agent config (required)
   AGENT_ID: string;
   AGENT_VERSION: string;
   ARKE_AGENT_KEY: string;
+
+  // Network-specific overrides (optional)
+  AGENT_ID_TEST?: string;
+  AGENT_ID_MAIN?: string;
+  ARKE_AGENT_KEY_TEST?: string;
+  ARKE_AGENT_KEY_MAIN?: string;
+
+  // Verification
   VERIFICATION_TOKEN?: string;
   ARKE_VERIFY_AGENT_ID?: string;
+
+  // Durable Object binding
   KLADOS_JOB: DurableObjectNamespace;
+
+  // Index signature for NetworkEnv compatibility
+  [key: string]: unknown;
 }
 
 /**
