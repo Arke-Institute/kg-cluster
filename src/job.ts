@@ -400,7 +400,8 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     client,
     request.target_collection,
     target.id,
-    myLayer
+    myLayer,
+    properties.label
   );
   await joinCluster(client, target.id, clusterId);
 

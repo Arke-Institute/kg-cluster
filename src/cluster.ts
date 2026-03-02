@@ -89,17 +89,24 @@ export async function createCluster(
   client: ArkeClient,
   collection: string,
   anchorEntityId: string,
-  myLayer: number
+  myLayer: number,
+  anchorLabel?: string
 ): Promise<string> {
-  console.log(`[cluster] Creating cluster_${anchorEntityId} at layer ${myLayer + 1}`);
+  // Generate a human-readable cluster label
+  const clusterLabel = anchorLabel
+    ? `Cluster: ${anchorLabel} (Layer ${myLayer + 1})`
+    : `Cluster (Layer ${myLayer + 1})`;
+
+  console.log(`[cluster] Creating "${clusterLabel}" for anchor ${anchorEntityId}`);
 
   const { data, error } = await (client.api.POST as Function)('/entities', {
     body: {
       type: 'cluster_leader',
       collection,
       properties: {
-        label: `cluster_${anchorEntityId}`,
+        label: clusterLabel,
         _kg_layer: myLayer + 1,
+        anchor_entity_id: anchorEntityId,
       },
       sync_index: true,
     },
