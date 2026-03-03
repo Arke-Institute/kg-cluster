@@ -90,15 +90,18 @@ export class KladosJobDO extends DurableObject<Env> {
    * Start a new job
    */
   private async handleStart(request: Request): Promise<Response> {
+    console.log('[kg-cluster DO] handleStart called');
     const body = await request.json() as {
       request: KladosRequest;
       config: KladosJobConfig;
     };
     const { request: kladosRequest, config } = body;
+    console.log('[kg-cluster DO] job_id:', kladosRequest.job_id);
 
     // Check if already started (idempotency)
     const existing = this.sql.exec('SELECT status FROM job_state WHERE id = 1').toArray();
     if (existing.length > 0) {
+      console.log('[kg-cluster DO] Job already started, returning existing');
       return Response.json({
         accepted: true,
         job_id: kladosRequest.job_id,
@@ -107,6 +110,7 @@ export class KladosJobDO extends DurableObject<Env> {
 
     // Generate log ID upfront
     const logId = `log_${generateId()}`;
+    console.log('[kg-cluster DO] Generated logId:', logId);
 
     // Save initial state
     const now = new Date().toISOString();
@@ -118,9 +122,11 @@ export class KladosJobDO extends DurableObject<Env> {
       logId,
       now
     );
+    console.log('[kg-cluster DO] Saved job state');
 
     // Schedule alarm for immediate processing
     await this.ctx.storage.setAlarm(Date.now() + 100);
+    console.log('[kg-cluster DO] Scheduled alarm for 100ms');
 
     return Response.json({
       accepted: true,
@@ -148,9 +154,14 @@ export class KladosJobDO extends DurableObject<Env> {
    * Alarm handler - processes the job
    */
   async alarm(): Promise<void> {
+    console.log('[kg-cluster] Alarm fired, checking job state...');
     const rows = this.sql.exec('SELECT * FROM job_state WHERE id = 1').toArray();
-    if (rows.length === 0) return;
+    if (rows.length === 0) {
+      console.log('[kg-cluster] No job state found, exiting');
+      return;
+    }
     const row = rows[0];
+    console.log('[kg-cluster] Found job state, status:', row.status);
 
     const request: KladosRequest = JSON.parse(row.request as string);
     const config: KladosJobConfig = JSON.parse(row.config as string);
@@ -164,6 +175,8 @@ export class KladosJobDO extends DurableObject<Env> {
     this.sql.exec(`UPDATE job_state SET status = 'processing' WHERE id = 1`);
 
     // Create client
+    console.log('[kg-cluster] Creating ArkeClient with baseUrl:', request.api_base, 'network:', request.network);
+    console.log('[kg-cluster] authToken prefix:', config.authToken?.substring(0, 10));
     const client = new ArkeClient({
       baseUrl: request.api_base,
       authToken: config.authToken,
@@ -174,7 +187,9 @@ export class KladosJobDO extends DurableObject<Env> {
     let logFileId = row.log_file_id as string | null;
 
     try {
+      console.log('[kg-cluster] Starting try block, logFileId:', logFileId);
       if (!logFileId) {
+        console.log('[kg-cluster] Creating log entry for job:', request.job_id);
         const logEntry: KladosLogEntry = {
           id: logId,
           type: 'klados_log',

@@ -45,14 +45,18 @@ app.get('/.well-known/arke-verification', (c) => {
  * Main job processing endpoint
  */
 app.post('/process', async (c) => {
+  console.log('[kg-cluster] /process endpoint called');
   const req = await c.req.json<KladosRequest>();
+  console.log('[kg-cluster] job_id:', req.job_id, 'network:', req.network);
 
   // Get DO instance by job_id (deterministic)
   const doId = c.env.KLADOS_JOB.idFromName(req.job_id);
   const doStub = c.env.KLADOS_JOB.get(doId);
+  console.log('[kg-cluster] DO stub obtained');
 
   // Get network-aware config for dual-network deployment
   const config = getKladosConfig(c.env, req.network);
+  console.log('[kg-cluster] Config agentId:', config.agentId, 'authToken prefix:', config.authToken?.substring(0, 10));
 
   // Start the job in the DO
   const response = await doStub.fetch(
@@ -65,8 +69,11 @@ app.post('/process', async (c) => {
       }),
     })
   );
+  console.log('[kg-cluster] DO response status:', response.status);
 
-  return c.json(await response.json() as KladosResponse);
+  const result = await response.json() as KladosResponse;
+  console.log('[kg-cluster] Returning result:', JSON.stringify(result));
+  return c.json(result);
 });
 
 export { KladosJobDO };
