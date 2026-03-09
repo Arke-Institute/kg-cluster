@@ -1,38 +1,20 @@
 /**
- * KladosJobDO - Durable Object for klados job processing
+ * KladosJobDO - Durable Object for clustering job processing
  *
- * Handles the full lifecycle of a clustering job:
- * - Stores job state in SQLite
- * - Writes initial log entry
- * - Processes via alarm (no 30s limit)
- * - Handles workflow handoffs
+ * This DO handles persistence and alarm scheduling for long-running jobs.
+ * All lifecycle logic (logging, handoffs, provenance) is delegated to
+ * KladosJob from @arke-institute/rhiza.
  */
 
 import { DurableObject } from 'cloudflare:workers';
-import { ArkeClient } from '@arke-institute/sdk';
 import {
-  KladosLogger,
-  writeKladosLog,
-  updateLogStatus,
-  updateLogWithHandoffs,
-  interpretThen,
-  failKlados,
+  KladosJob,
   generateId,
   type KladosRequest,
-  type KladosLogEntry,
-  type FlowStep,
+  type KladosJobConfig,
 } from '@arke-institute/rhiza';
 import { processJob } from './job';
 import type { Env } from './types';
-
-/**
- * Job configuration passed from the worker
- */
-export interface KladosJobConfig {
-  agentId: string;
-  agentVersion: string;
-  authToken: string;
-}
 
 /**
  * Job status state machine
@@ -41,6 +23,9 @@ type JobStatus = 'accepted' | 'processing' | 'done' | 'error';
 
 /**
  * KladosJobDO - Durable Object that processes clustering jobs
+ *
+ * Each job gets its own DO instance (keyed by job_id).
+ * Processing happens in alarm handler, allowing multi-minute operations.
  */
 export class KladosJobDO extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -51,9 +36,6 @@ export class KladosJobDO extends DurableObject<Env> {
     this.initSchema();
   }
 
-  /**
-   * Initialize SQLite schema for job state
-   */
   private initSchema() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS job_state (
@@ -69,9 +51,6 @@ export class KladosJobDO extends DurableObject<Env> {
     `);
   }
 
-  /**
-   * Handle incoming requests from the worker
-   */
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -86,33 +65,23 @@ export class KladosJobDO extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
-  /**
-   * Start a new job
-   */
   private async handleStart(request: Request): Promise<Response> {
-    console.log('[kg-cluster DO] handleStart called');
     const body = await request.json() as {
       request: KladosRequest;
       config: KladosJobConfig;
     };
     const { request: kladosRequest, config } = body;
-    console.log('[kg-cluster DO] job_id:', kladosRequest.job_id);
 
     // Check if already started (idempotency)
-    const existing = this.sql.exec('SELECT status FROM job_state WHERE id = 1').toArray();
-    if (existing.length > 0) {
-      console.log('[kg-cluster DO] Job already started, returning existing');
+    const existing = this.sql.exec('SELECT status FROM job_state WHERE id = 1').toArray()[0];
+    if (existing) {
       return Response.json({
         accepted: true,
         job_id: kladosRequest.job_id,
       });
     }
 
-    // Generate log ID upfront
     const logId = `log_${generateId()}`;
-    console.log('[kg-cluster DO] Generated logId:', logId);
-
-    // Save initial state
     const now = new Date().toISOString();
     this.sql.exec(
       `INSERT INTO job_state (id, request, config, log_id, status, created_at)
@@ -122,11 +91,8 @@ export class KladosJobDO extends DurableObject<Env> {
       logId,
       now
     );
-    console.log('[kg-cluster DO] Saved job state');
 
-    // Schedule alarm for immediate processing
     await this.ctx.storage.setAlarm(Date.now() + 100);
-    console.log('[kg-cluster DO] Scheduled alarm for 100ms');
 
     return Response.json({
       accepted: true,
@@ -134,16 +100,12 @@ export class KladosJobDO extends DurableObject<Env> {
     });
   }
 
-  /**
-   * Get current job status
-   */
   private handleStatus(): Response {
-    const rows = this.sql.exec('SELECT status, error FROM job_state WHERE id = 1').toArray();
-    if (rows.length === 0) {
+    const row = this.sql.exec('SELECT status, error FROM job_state WHERE id = 1').toArray()[0];
+    if (!row) {
       return Response.json({ status: 'not_found' }, { status: 404 });
     }
 
-    const row = rows[0];
     return Response.json({
       status: row.status,
       error: row.error,
@@ -152,177 +114,46 @@ export class KladosJobDO extends DurableObject<Env> {
 
   /**
    * Alarm handler - processes the job
+   *
+   * Delegates all lifecycle logic (logging, handoffs, provenance) to KladosJob.
+   * Only handles persistence (SQL) and rescheduling (alarms).
    */
   async alarm(): Promise<void> {
-    console.log('[kg-cluster] Alarm fired, checking job state...');
-    const rows = this.sql.exec('SELECT * FROM job_state WHERE id = 1').toArray();
-    if (rows.length === 0) {
-      console.log('[kg-cluster] No job state found, exiting');
-      return;
-    }
-    const row = rows[0];
-    console.log('[kg-cluster] Found job state, status:', row.status);
+    const row = this.sql.exec('SELECT * FROM job_state WHERE id = 1').toArray()[0];
+    if (!row) return;
 
-    const request: KladosRequest = JSON.parse(row.request as string);
-    const config: KladosJobConfig = JSON.parse(row.config as string);
-    const logId = row.log_id as string;
-
-    // Skip if already terminal
     const status = row.status as JobStatus;
     if (status === 'done' || status === 'error') return;
 
-    // Update status to processing
     this.sql.exec(`UPDATE job_state SET status = 'processing' WHERE id = 1`);
 
-    // Create client
-    console.log('[kg-cluster] Creating ArkeClient with baseUrl:', request.api_base, 'network:', request.network);
-    console.log('[kg-cluster] authToken prefix:', config.authToken?.substring(0, 10));
-    const client = new ArkeClient({
-      baseUrl: request.api_base,
-      authToken: config.authToken,
-      network: request.network,
+    const request: KladosRequest = JSON.parse(row.request as string);
+    const config: KladosJobConfig = JSON.parse(row.config as string);
+
+    const job = KladosJob.accept(request, config, undefined, {
+      logFileId: (row.log_file_id as string) || undefined,
     });
 
-    const logger = new KladosLogger();
-    let logFileId = row.log_file_id as string | null;
-
     try {
-      console.log('[kg-cluster] Starting try block, logFileId:', logFileId);
-      if (!logFileId) {
-        console.log('[kg-cluster] Creating log entry for job:', request.job_id);
-        const logEntry: KladosLogEntry = {
-          id: logId,
-          type: 'klados_log',
-          klados_id: config.agentId,
-          rhiza_id: request.rhiza?.id,
-          job_id: request.job_id,
-          started_at: new Date().toISOString(),
-          status: 'running',
-          received: {
-            target_entity: request.target_entity,
-            target_entities: request.target_entities,
-            target_collection: request.target_collection,
-            from_logs: request.rhiza?.parent_logs,
-            batch: request.rhiza?.batch,
-            scatter_total: request.rhiza?.scatter_total,
-          },
-        };
+      await job.start();
 
-        const { fileId } = await writeKladosLog({
-          client,
-          jobCollectionId: request.job_collection,
-          entry: logEntry,
-          messages: logger.getMessages(),
-          agentId: config.agentId,
-          agentVersion: config.agentVersion,
-        });
-
-        logFileId = fileId;
-        this.sql.exec(`UPDATE job_state SET log_file_id = ? WHERE id = 1`, logFileId);
+      if (job.logEntityId && !row.log_file_id) {
+        this.sql.exec(`UPDATE job_state SET log_file_id = ? WHERE id = 1`, job.logEntityId);
       }
 
-      // Process the job
-      const result = await processJob({
-        request,
-        client,
-        logger,
-        sql: this.sql,
-        env: this.env,
-      });
+      const result = await processJob({ job, sql: this.sql, env: this.env });
 
-      // Handle reschedule
       if (result.reschedule) {
-        logger.info('Rescheduling for continued processing');
+        job.log.info('Rescheduling for continued processing');
         await this.ctx.storage.setAlarm(Date.now() + 1000);
         return;
       }
 
-      // Handle workflow handoff if in a workflow
-      let handoffAction: string | undefined;
-      if (request.rhiza && result.outputs && result.outputs.length > 0) {
-        const { data: rhizaEntity, error: rhizaError } = await client.api.GET('/entities/{id}', {
-          params: { path: { id: request.rhiza.id } },
-        });
-
-        if (rhizaError || !rhizaEntity) {
-          throw new Error(`Failed to fetch rhiza: ${request.rhiza.id}`);
-        }
-
-        const flow = rhizaEntity.properties.flow as Record<string, FlowStep>;
-        const currentStepName = request.rhiza.path?.at(-1);
-
-        if (currentStepName && flow) {
-          const myStep = flow[currentStepName];
-          if (myStep?.then) {
-            const handoffResult = await interpretThen(
-              myStep.then,
-              {
-                client,
-                rhizaId: request.rhiza.id,
-                kladosId: config.agentId,
-                jobId: request.job_id,
-                targetCollection: request.target_collection,
-                jobCollectionId: request.job_collection,
-                flow,
-                outputs: result.outputs || [],
-                fromLogId: logFileId,
-                path: request.rhiza.path,
-                apiBase: request.api_base,
-                network: request.network,
-                batchContext: request.rhiza.batch,
-                authToken: config.authToken,
-              }
-            );
-
-            handoffAction = handoffResult.action;
-
-            if (handoffResult.handoffRecord) {
-              await updateLogWithHandoffs(client, logFileId, [handoffResult.handoffRecord]);
-            }
-
-            logger.info(`Handoff: ${handoffResult.action}`, {
-              target: handoffResult.target,
-              targetType: handoffResult.targetType,
-            });
-          }
-        }
-      }
-
-      // Finalize log with entity provenance linking
-      const isTerminal = !!(request.rhiza && (!handoffAction || handoffAction === 'done'));
-      logger.success('Job completed');
-
-      const inputEntityIds: string[] = [];
-      if (request.target_entity) inputEntityIds.push(request.target_entity);
-      if (request.target_entities?.length) inputEntityIds.push(...request.target_entities);
-
-      const outputIds = (result.outputs || []).map((o: string | { entity_id: string }) => typeof o === 'string' ? o : o.entity_id);
-
-      await updateLogStatus(client, logFileId, 'done', {
-        messages: logger.getMessages(),
-        outputs: outputIds.length > 0 ? outputIds : undefined,
-        inputEntityIds: inputEntityIds.length > 0 ? inputEntityIds : undefined,
-        linkEntitiesToLogs: true,
-        jobCollectionId: request.job_collection,
-        isTerminal,
-      });
-
+      await job.complete(result.outputs || []);
       this.sql.exec(`UPDATE job_state SET status = 'done' WHERE id = 1`);
-
     } catch (error) {
+      await job.fail(error);
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('Job failed', { error: errorMessage });
-
-      if (logFileId) {
-        await failKlados(client, {
-          logFileId,
-          batchContext: request.rhiza?.batch,
-          error,
-          messages: logger.getMessages(),
-          jobCollectionId: request.job_collection,
-        });
-      }
-
       this.sql.exec(
         `UPDATE job_state SET status = 'error', error = ? WHERE id = 1`,
         errorMessage

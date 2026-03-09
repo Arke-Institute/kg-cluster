@@ -9,8 +9,8 @@
  * 5. Else: create own cluster
  */
 
+import type { KladosJob, KladosLogger, Output } from '@arke-institute/rhiza';
 import type { ArkeClient } from '@arke-institute/sdk';
-import type { KladosLogger, KladosRequest, Output } from '@arke-institute/rhiza';
 import type { Env, TargetProperties, ClusterInputProperties, EntityInfo } from './types';
 import { findSimilarPeers } from './semantic';
 import {
@@ -62,9 +62,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 export interface ProcessContext {
-  request: KladosRequest;
-  client: ArkeClient;
-  logger: KladosLogger;
+  /** KladosJob instance (provides client, logger, request, fetchTarget, etc.) */
+  job: KladosJob;
   sql: SqlStorage;
   env: Env;
 }
@@ -199,7 +198,8 @@ async function waitForFollowers(
  * - If created cluster but no followers after wait: outputs = [] (done, hierarchy terminates)
  */
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
-  const { request, client, logger } = ctx;
+  const { job } = ctx;
+  const { request, client, log: logger } = job;
 
   // Extract configurable parameters
   const inputProps = (request.input || {}) as ClusterInputProperties;
