@@ -138,7 +138,8 @@ async function main() {
     process.exit(1);
   }
 
-  const config: KladosConfig = JSON.parse(readFileSync('agent.json', 'utf-8'));
+  const agentJson = JSON.parse(readFileSync('agent.json', 'utf-8'));
+  const config: KladosConfig = agentJson;
   console.log(`Agent: ${config.label}`);
   console.log(`Endpoint: ${config.endpoint}`);
   console.log('');
@@ -238,6 +239,27 @@ async function main() {
 
       console.log('\n🚀 Final deployment...');
       execSync('wrangler deploy', { stdio: 'inherit' });
+    }
+
+    // Sync input_schema from agent.json (until rhiza registration supports this natively)
+    if (agentJson.input?.klados_input) {
+      const { data: tipData } = await client.api.GET('/entities/{id}/tip', {
+        params: { path: { id: newState.klados_id } },
+      });
+      if (tipData) {
+        const { error: schemaError } = await client.api.PUT('/kladoi/{id}', {
+          params: { path: { id: newState.klados_id } },
+          body: {
+            expect_tip: tipData.cid,
+            input_schema: agentJson.input.klados_input,
+          },
+        });
+        if (schemaError) {
+          console.warn(`  Could not update input_schema: ${schemaError.error}`);
+        } else {
+          console.log('  Synced input_schema from agent.json');
+        }
+      }
     }
 
     if (action !== 'unchanged') {
