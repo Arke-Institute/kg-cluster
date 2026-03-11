@@ -56,53 +56,58 @@
     },
 
     "klados_input": {
-      "description": "Configurable parameters for clustering behavior. All have sensible defaults.",
+      "description": "Configurable parameters for clustering behavior. All have sensible defaults. Properties map directly to keys in request.input.",
       "properties": {
-        "optional": {
-          "index_wait_ms": {
-            "type": "integer",
-            "description": "Minimum wait time for semantic indexing before searching (ms). Entities must be indexed to be found via similarity search.",
-            "default": 90000,
-            "minimum": 0
-          },
-          "initial_spread_ms": {
-            "type": "integer",
-            "description": "Additional random spread for staggering concurrent job starts (ms). Total initial delay = index_wait_ms + random(0, initial_spread_ms).",
-            "default": 30000,
-            "minimum": 0
-          },
-          "follower_wait_min_ms": {
-            "type": "integer",
-            "description": "Minimum time to wait for followers after creating a cluster (ms). Uses jittery wait between min and max.",
-            "default": 30000,
-            "minimum": 0
-          },
-          "follower_wait_max_ms": {
-            "type": "integer",
-            "description": "Maximum time to wait for followers after creating a cluster (ms).",
-            "default": 60000,
-            "minimum": 0
-          },
-          "follower_poll_interval_ms": {
-            "type": "integer",
-            "description": "Interval between checks for new followers (ms).",
-            "default": 5000,
-            "minimum": 1000
-          },
-          "k": {
-            "type": "integer",
-            "description": "Number of similar peers to consider for clustering. Higher K finds more potential clusters but increases API calls.",
-            "default": 15,
-            "minimum": 1,
-            "maximum": 50
-          },
-          "max_cluster_size": {
-            "type": "integer",
-            "description": "Soft cap on cluster members before overflow. Acts as branching factor - hierarchy depth is log_max(N). Smaller values create deeper, more specific hierarchies.",
-            "default": 5,
-            "minimum": 2,
-            "maximum": 50
-          }
+        "index_wait_ms": {
+          "type": "integer",
+          "required": false,
+          "description": "Minimum wait time for semantic indexing before searching (ms). Entities must be indexed to be found via similarity search.",
+          "default": 90000,
+          "minimum": 0
+        },
+        "initial_spread_ms": {
+          "type": "integer",
+          "required": false,
+          "description": "Additional random spread for staggering concurrent job starts (ms). Total initial delay = index_wait_ms + random(0, initial_spread_ms).",
+          "default": 30000,
+          "minimum": 0
+        },
+        "follower_wait_min_ms": {
+          "type": "integer",
+          "required": false,
+          "description": "Minimum time to wait for followers after creating a cluster (ms). Uses jittery wait between min and max.",
+          "default": 30000,
+          "minimum": 0
+        },
+        "follower_wait_max_ms": {
+          "type": "integer",
+          "required": false,
+          "description": "Maximum time to wait for followers after creating a cluster (ms).",
+          "default": 60000,
+          "minimum": 0
+        },
+        "follower_poll_interval_ms": {
+          "type": "integer",
+          "required": false,
+          "description": "Interval between checks for new followers (ms).",
+          "default": 5000,
+          "minimum": 1000
+        },
+        "k": {
+          "type": "integer",
+          "required": false,
+          "description": "Number of similar peers to consider for clustering. Higher K finds more potential clusters but increases API calls.",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 50
+        },
+        "max_cluster_size": {
+          "type": "integer",
+          "required": false,
+          "description": "Soft cap on cluster members before overflow. Acts as branching factor - hierarchy depth is log_max(N). Smaller values create deeper, more specific hierarchies.",
+          "default": 5,
+          "minimum": 2,
+          "maximum": 50
         }
       }
     },
